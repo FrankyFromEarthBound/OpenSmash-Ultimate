@@ -24,6 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef MSG_NOSIGNAL
+#define UPNP_NOSIGNAL MSG_NOSIGNAL      /* Linux: a send to a router that closed early fails instead of raising SIGPIPE */
+#else
+#define UPNP_NOSIGNAL 0
+#endif
 #ifdef _WIN32
 #define COBJMACROS
 #include <ole2.h>
@@ -182,11 +187,14 @@ static int upnp_http(const upnp_url *u, const char *head, const char *body, char
     a.sin_port = htons(u->port);
     if (inet_pton(AF_INET, u->host, &a.sin_addr) != 1) return 0;          /* an IGD's description URL is an IP address */
     if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0) return 0;
+#ifdef SO_NOSIGPIPE
+    { int one = 1; setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); }     /* macOS: a send to a closed connection fails, no SIGPIPE */
+#endif
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);              /* (also bounds connect on Linux) */
     len = snprintf(req, sizeof req, "%s %s HTTP/1.0\r\nHost: %s:%u\r\n%sContent-Length: %u\r\nConnection: close\r\n\r\n%s",
                    body ? "POST" : "GET", u->path, u->host, u->port, head ? head : "", body ? (unsigned)strlen(body) : 0u, body ? body : "");
-    if (len > 0 && len < (int)sizeof req && !connect(s, (struct sockaddr *)&a, sizeof a) && send(s, req, (size_t)len, 0) == len) {
+    if (len > 0 && len < (int)sizeof req && !connect(s, (struct sockaddr *)&a, sizeof a) && send(s, req, (size_t)len, UPNP_NOSIGNAL) == len) {
         for (;;) {
             ssize_t r = recv(s, out + got, n - 1 - got, 0);
             if (r <= 0) break;
