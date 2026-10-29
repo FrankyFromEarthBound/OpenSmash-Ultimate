@@ -69,14 +69,18 @@
 #include <stdarg.h>
 #include <windows.h>
 
-#define LF_MAX 4096
+#define LF_MAX 65536                 /* MT: a skin pack can bring several thousand files per mod (whole motion sets); a merged pack of ~570 mods has ~33000 */
 #define LF_MAX_FOLDERS 1024
 #define LF_MAX_OWNERS 16
-#define LF_MAX_NEW 16384
-#define LF_MAX_GROUPS 64
+#define LF_MAX_NEW 65536
+#define LF_MAX_PLAN 524288          /* MT: file infos copied + added: every extended slot directory copies its whole range (400-550 rows); the merged pack extends ~640 */
+#define LF_MAX_GROUPS 2048
 #define LF_NPRE 2
 #define LF_MASK40 0xffffffffffull
 #define LF_NONE 0xffffffu
+#define LF_XINFO 8
+#define LF_NREGION 15               /* MT: info-to-data rows after a localized file's own: one per language (the game takes itd + 1 + its language) */
+static int lf_cmp_u64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 typedef struct {
     uint64_t hash;                  // hash40 of the archive path
     char *arc_path, *disk_path;
@@ -88,31 +92,53 @@ typedef struct {
     int is_new;                     // stage 2: the row was added by us
     uint64_t donor_hash;            // stage 2: the archive file whose data rows the new row shares
     uint64_t name_hash;             // B3: hash40 of the file NAME when the folder file is named "0x<name hash>.<ext>", else 0
+    uint64_t xdir;                  // MT: a plain mod folder's file: the EXISTING directory it is added to when the archive has no such path
+    char *xdir_path;
+    uint32_t info_alt;              // MT: the file's info in the copied range of an extended directory (0 = none)
+    uint8_t shared;                 // MT: the archive SHARES this path's data with another path (another slot's file): unshared before it is served
+    uint8_t reshare;                // MT: the OTHER way round: other slots' paths share this path's data (its directory's own row): they are
+                                    // led to a vanilla copy of its chain (ARCropolis' reshare_dependent_files), this file is replaced in place
+    uint32_t info_x[LF_XINFO];      // MT: an unshared file's other entries (the Pokemon Trainer's directories; its slot directory's second rows), led to its virtual record too
+    int nx;
+    int solo_plan;                  // MT: plan row + 1 of a shared file no directory lists (requested singly: sound banks), 0 = none
+    uint8_t standalone;             // MT (SSBU_LOOSE_STANDALONE): its virtual record is a file of no directory, asked for on its own when another directory listing it loads
+    volatile long sa_queued;        // a request of it queued by lf_dirload, not yet served
+    uint32_t sa_dir;                // the directory info of its own group (the one whose batch loads its virtual record), LF_NONE = none
+    uint32_t info_single;           // its file info for a request of it on its own (its indice's), a raw record the whole file long; 0 = none
+    uint32_t rdi[LF_NREGION];       // MT: a localized file (info flags 0x18000): the data rows of its languages (info-to-data itd + 1 ...)
+    uint8_t nr;
 } LooseFile;
 typedef struct { char name[32], donor[32]; int files, new_files, renamed, private_rows, shared_rows; long served, donor_bytes_files; unsigned long long bytes; } LooseOwner;
 typedef struct { uint64_t hash, parent_hash, name_hash, donor_hash; int owner, exists; uint32_t fpos, ipos; } LooseFolder;
 // a file with a new identity: kind 1 = the folder brings it (loose file), 2 = renamed, the donor's bytes, 3 = private hash
 typedef struct { uint64_t hash, parent_hash; int64_t donor_pi; uint32_t donor_xi, donor_ii, info_pos; int loose, owner, kind; } LooseNew;
 typedef struct { uint64_t hash, donor_hash, parent_hash; int owner, is_link; uint32_t dir_index, donor_dir, info_start, count, child_start, child_count, fo_new, fo_src, fo_target;
-                 long finished; char path[96]; } LooseGroup;
+                 long finished; int inplace; char path[96]; } LooseGroup;
 static LooseFile g_lf[LF_MAX];
+static int lf_is_xinfo(const LooseFile *f, uint32_t info_index);
+static int g_lf_samedir;           // MT: unshared files whose slot directory had more entries on the same shared record
 static LooseOwner g_lf_owner[LF_MAX_OWNERS];
 static LooseFolder g_lf_folder[LF_MAX_FOLDERS];
 static LooseNew g_lf_new[LF_MAX_NEW];
 static LooseGroup g_lf_group[LF_MAX_GROUPS];
 static uint64_t g_lf_child[LF_MAX_GROUPS * 8]; static int g_lf_child_count, g_lf_fo_count;
-static struct { uint32_t donor_ii; int32_t new_index; } g_lf_plan[LF_MAX_NEW * 2];     // the new file infos, in order
+static struct { uint32_t donor_ii; int32_t new_index; } g_lf_plan[LF_MAX_PLAN];     // the new file infos, in order
+#define LF_MAX_PFIX 4096
+static struct { int plan; uint32_t path; } g_lf_pfix[LF_MAX_PFIX];     // MT: planned rows that name another path than their donor row
+static int g_lf_pfix_count;
 static int g_lf_count, g_lf_resolved, g_lf_owner_count, g_lf_folder_count, g_lf_new_count, g_lf_grown, g_lf_group_count, g_lf_plan_count;
 static long g_lf_served_new, g_lf_done_kind[8]; static unsigned long long g_lf_served_new_bytes;
 static volatile int g_lf_scanned;
 static uint32_t g_lf_first_new_info;
 static int g_lf_search_on, g_lf_early;
-#define LF_MAX_TMPL 1024
+static int g_lf_xcount, g_lf_ushare, g_lf_reshare;             /* MT: plain mod files with a directory to be added to (config.json or the path) */
+#define LF_MAX_TMPL 8192
 static struct { uint32_t itd, data_index, size, info; } g_lf_tmpl[LF_MAX_TMPL];      // N8: files made from a group's template
 static int g_lf_virtual;            // N10: SSBU_LOOSE_TEMPLATE=3: such files are VIRTUAL records (no bytes of the archive)
 static uint64_t g_ls_fidx, g_ls_flist; static uint32_t g_ls_nfold;          // the archive's own search folder tables (before the growth)
 static void (*g_lf_log)(const char *);
 static HookOrig g_lf_orig_inflate;
+static long g_lf_sa_count, g_lf_sa_served;      /* MT: files with a standalone virtual record (SSBU_LOOSE_STANDALONE) */
 static CRITICAL_SECTION g_lf_lock;
 
 static void lf_logf(const char *fmt, ...) {
@@ -180,6 +206,8 @@ static uint64_t lf_r64(uint64_t a) { uint64_t v; memcpy(&v, (void *)(uintptr_t)a
 static uint32_t lf_r32(uint64_t a) { uint32_t v; memcpy(&v, (void *)(uintptr_t)a, 4); return v; }
 static void lf_w64(uint64_t a, uint64_t v) { memcpy((void *)(uintptr_t)a, &v, 8); }
 static void lf_w32(uint64_t a, uint32_t v) { memcpy((void *)(uintptr_t)a, &v, 4); }
+static uint8_t lf_r8(uint64_t a) { return *(volatile uint8_t *)(uintptr_t)a; }
+static void lf_w8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
 
 // ---------------------------------------------------------------- the folder scan
 static int lf_json_str(const char *js, const char *key, char *out, size_t n) {
@@ -226,7 +254,8 @@ static int lf_add_folder(const char *path, int owner) {
     if (s) *s = 0; else parent[0] = 0;
     lf_add_folder(parent, owner);
     const char *leaf = strrchr(path, '/'); leaf = leaf ? leaf + 1 : path;
-    lf_donor_path(path, g_lf_owner[owner].name, g_lf_owner[owner].donor, dpath, sizeof dpath);
+    if (owner >= 0) lf_donor_path(path, g_lf_owner[owner].name, g_lf_owner[owner].donor, dpath, sizeof dpath);
+    else snprintf(dpath, sizeof dpath, "%s", path);         /* MT: a plain mod folder's file: no donor */
     return lf_folder_put(lf_hash40(path), parent[0] ? lf_hash40(parent) : 0, lf_hash40(leaf), strcmp(dpath, path) ? lf_hash40(dpath) : 0, owner);
 }
 // the renaming prefixes of a fighter folder: k = 0 "fighter/<name>", 1 "effect/fighter/<name>"
@@ -274,7 +303,11 @@ static void lf_scan(const char *dir, const char *rel, int owner) {
         /* N9: "src" at the top of a fighter's folder holds the fighter's script sources (fighter_sdk\tools\new_fighter.py): not archive content */
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !rel[0] && !_stricmp(fd.cFileName, "src")) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { lf_scan(sub, r, owner); continue; }
-        if (g_lf_count >= LF_MAX) continue;
+        if (g_lf_count >= LF_MAX) {
+            static int warned;
+            if (!warned++) lf_logf("[loose] more than %d mod files: %s and the rest are NOT loaded", LF_MAX, sub);
+            continue;
+        }
         size_t n = strlen(r);
         if (!strchr(r, '/')) continue;       // the top of a fighter's folder is not archive content (manifest, script DLL, lists)
         for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
@@ -318,6 +351,99 @@ static void lf_clone_list(const char *folder, int owner, int first) {
     free(js);
     lf_logf("[loose] %s: clone_files.json gives the path hash and the donor file of %d of its files", g_lf_owner[owner].name, listed);
 }
+static void lf_set_xdir(LooseFile *f, const char *dir) {
+    char d[400]; snprintf(d, sizeof d, "%s", dir);
+    for (char *p = d; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+    f->xdir = (d[0] == '0' && d[1] == 'x') ? strtoull(d, NULL, 16) : lf_hash40(d); f->xdir_path = _strdup(d);
+}
+/* MT: a one-slot effect file? effect/fighter/<f>/ef_<f>_cNN.eff (*trail = 0) or effect/fighter/<f>/trail_cNN/... (*trail
+ * = 1) -> NN, the fighter's name in fi; else -1 */
+static int lf_eff_slot_of(const char *p, char *fi, size_t nfi, int *trail) {
+    if (strncmp(p, "effect/fighter/", 15)) return -1;
+    const char *a = p + 15, *e = strchr(a, '/');
+    if (!e || e == a || (size_t)(e - a) >= 64) return -1;
+    char name[64]; snprintf(name, sizeof name, "%.*s", (int)(e - a), a);
+    const char *r = e + 1, *s = NULL; int t = 0;
+    char pre[80]; snprintf(pre, sizeof pre, "ef_%s_c", name);
+    if (!strchr(r, '/') && !strncmp(r, pre, strlen(pre))) { s = r + strlen(pre); if (strcmp(s + 2, ".eff")) return -1; }
+    else if (!strncmp(r, "trail_c", 7) && r[9] == '/') { s = r + 7; t = 1; }
+    if (!s || s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9') return -1;
+    if (fi) snprintf(fi, nfi, "%s", name);
+    if (trail) *trail = t;
+    return (s[0] - '0') * 10 + (s[1] - '0');
+}
+/* MT: the directory a plain mod folder's file belongs to, for files the archive does not have (ARCropolis' new-dir-files):
+ * the folder's config.json ("new-dir-files": {"<directory>": ["<file>", ...]}) first, else from the path, for every slot:
+ * fighter/<f>/{model,motion,sound,effect,param}/.../cNN/... -> fighter/<f>/cNN, fighter/<f>/{camera,result,movie}/cNN/...
+ * -> fighter/<f>/<that>/cNN, camera/fighter/<f>/cNN/... -> fighter/<f>/camera/cNN */
+static void lf_plain_dirs(const char *folder, int first) {
+    char path[MAX_PATH * 2]; int from_cfg = 0, from_path = 0;
+    snprintf(path, sizeof path, "%s\\config.json", folder);
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
+        char *js = malloc((size_t)n + 1);
+        n = (long)fread(js, 1, (size_t)n, fp); js[n] = 0; fclose(fp);
+        char *p = strstr(js, "\"new-dir-files\""); if (!p) p = strstr(js, "\"new_dir_files\"");
+        if (p && (p = strchr(p + 15, '{'))) {
+            char key[400];
+            for (p++; *p && *p != '}'; ) {
+                while (*p && *p != '"' && *p != '}') p++;
+                if (*p != '"') break;
+                char *e = strchr(p + 1, '"'); if (!e) break;
+                snprintf(key, sizeof key, "%.*s", (int)(e - p - 1), p + 1);
+                char *lb = strchr(e, '['), *rb = lb ? strchr(lb, ']') : NULL; if (!rb) break;
+                for (char *q = lb; q < rb; ) {
+                    char *a = memchr(q, '"', (size_t)(rb - q)); if (!a) break;
+                    char *b = memchr(a + 1, '"', (size_t)(rb - a - 1)); if (!b) break;
+                    char file[400]; snprintf(file, sizeof file, "%.*s", (int)(b - a - 1), a + 1);
+                    for (char *c = file; *c; c++) if (*c >= 'A' && *c <= 'Z') *c += 32;
+                    for (int k = first; k < g_lf_count; k++)
+                        if (!g_lf[k].xdir && !strcmp(g_lf[k].arc_path, file)) { lf_set_xdir(&g_lf[k], key); from_cfg++; break; }
+                    q = b + 1;
+                }
+                p = rb + 1;
+            }
+        }
+        free(js);
+    }
+    for (int k = first; k < g_lf_count; k++) {
+        LooseFile *f = &g_lf[k];
+        if (f->xdir) continue;
+        char t[400], *c[16]; int n = 0; snprintf(t, sizeof t, "%s", f->arc_path);
+        for (char *s = strtok(t, "/"); s && n < 16; s = strtok(NULL, "/")) c[n++] = s;
+        int slot = -1;
+        for (int i = 0; i < n - 1; i++) if (c[i][0] == 'c' && c[i][1] >= '0' && c[i][1] <= '9' && c[i][2] >= '0' && c[i][2] <= '9' && !c[i][3]) { slot = i; break; }
+        char d[200];
+        /* one-slot effects (as reference\ARCropolis' inference): effect/fighter/<f>/ef_<f>_cNN.eff and
+         * effect/fighter/<f>/trail_cNN/... belong to fighter/<f>/cNN */
+        if (n >= 4 && !strcmp(c[0], "effect") && !strcmp(c[1], "fighter")) {
+            int sl = lf_eff_slot_of(f->arc_path, NULL, 0, NULL);
+            if (sl >= 0) { snprintf(d, sizeof d, "fighter/%s/c%02d", c[2], sl); lf_set_xdir(f, d); from_path++; }
+            continue;
+        }
+        /* MT: a stage's new files belong to the directory of their own folder (each stage model set is a directory of the
+         * archive: stage/battlefield_s/normal/model/ring_nocastshadow_set, 32 files; stage/<stage>/<form> lists none)
+         * (pack "Super Duper Melee": ring_nocastshadow_set/extratexture.nutexb not served). The directory also lets a stage's
+         * SHARED files be unshared: ring_plant_set/model.numdlb is one record for Battlefield and Small Battlefield; replaced in
+         * place, only one of the two mod files was served, Small Battlefield got the vanilla numdlb beside the mod's numatb
+         * (crash in the model loader f_71035ff340) */
+        if (n >= 4 && !strcmp(c[0], "stage")) {
+            const char *sl = strrchr(f->arc_path, '/');
+            snprintf(d, sizeof d, "%.*s", (int)(sl - f->arc_path), f->arc_path); lf_set_xdir(f, d); from_path++; continue;
+        }
+        if (slot < 0) continue;
+        if (n >= 4 && !strcmp(c[0], "fighter") && slot >= 3 && (!strcmp(c[2], "model") || !strcmp(c[2], "motion") || !strcmp(c[2], "sound") || !strcmp(c[2], "effect") || !strcmp(c[2], "param")))
+            snprintf(d, sizeof d, "fighter/%s/%s", c[1], c[slot]);
+        else if (n >= 4 && !strcmp(c[0], "fighter") && slot == 3 && (!strcmp(c[2], "camera") || !strcmp(c[2], "result") || !strcmp(c[2], "movie")))
+            snprintf(d, sizeof d, "fighter/%s/%s/%s", c[1], c[2], c[slot]);
+        else if (n >= 5 && !strcmp(c[0], "camera") && !strcmp(c[1], "fighter") && slot == 3)
+            snprintf(d, sizeof d, "fighter/%s/camera/%s", c[2], c[slot]);
+        else continue;
+        lf_set_xdir(f, d); from_path++;
+    }
+    if (from_cfg || from_path) lf_logf("[loose] %s: a directory for files the archive may not have: %d from config.json, %d from their paths", folder, from_cfg, from_path);
+}
 
 // ---------------------------------------------------------------- the archive's in-memory tables
 // 2026-10-16 (owner: menus and movies at 3 fps in the two-new-fighter build): this ran on EVERY decompress of the
@@ -357,6 +483,22 @@ static int lf_tables(uint64_t service, uint64_t *fsinfo, uint64_t *arc) {
     }
     return 1;
 }
+/* MT: the info-to-data row the load thread takes for a file info. A localized file (info flags bits 15-16: 1 or 2)
+ * has one row per language after its own (which is empty: size 0): the thread 0x7103544a70 (13.0.5) takes
+ * itd + 1 + the language of the game's config ([0x7105332000 + 0xf28] + 0xdc for mode 1, + 0xd8 for mode 2; -1 = 0).
+ * Extended trials mp1 (heap census): every localized mod file (voices, narration, msg_name) was written into a buffer
+ * of the vanilla size, up to 1.6 MB past its end: the sizes were raised on the empty row. */
+static uint32_t lf_itd_live(uint64_t infos, uint32_t ii) {
+    uint32_t itd = lf_r32(infos + 16ull * ii + 8), m = (lf_r32(infos + 16ull * ii + 12) >> 15) & 3;
+    if ((m == 1 || m == 2) && g_game_build == GAME_13_0_5) {
+        uint64_t cfg = lf_r64(0x7105332000ull + 0xf28);
+        int32_t v = cfg ? (int32_t)lf_r32(cfg + (m == 2 ? 0xd8 : 0xdc)) : 0;
+        if (v < 0 || v >= LF_NREGION) v = 0;
+        itd += 1 + (uint32_t)v;
+    }
+    return itd;
+}
+static uint32_t lf_data_live(uint64_t arc, uint32_t ii) { return lf_r32(lf_r64(arc + 0x98) + 12ull * lf_itd_live(lf_r64(arc + 0x90), ii) + 4); }
 static int64_t lf_find(uint64_t arc, uint64_t hash) {                // the game's own lookup: bucket, then the sorted range
     uint64_t buckets = lf_r64(arc + 0x50), entries = lf_r64(arc + 0x58);
     uint32_t nb = lf_r32(buckets + 4);
@@ -452,7 +594,9 @@ static DWORD WINAPI lf_sync_thread(LPVOID arg) {
 }
 
 // STAGE 2: rows for the fighter folders: a load group per fighter, rows for its files, search entries
+static uint64_t g_lf_fsinfo;                                  /* MT: the filesystem info of the growth (one-slot effects) */
 static void lf_grow(uint64_t fsinfo, uint64_t arc) {
+    g_lf_fsinfo = fsinfo;
     uint64_t search = lf_r64(lf_r64(fsinfo + 0x78) + 8);
     uint64_t hdr = lf_r64(arc + 0x40), paths = lf_r64(arc + 0x60), ind = lf_r64(arc + 0x68), infos = lf_r64(arc + 0x90);
     uint64_t to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0), buckets = lf_r64(arc + 0x50), entries = lf_r64(arc + 0x58);
@@ -495,7 +639,8 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
     int diag = getenv("SSBU_LOOSE_DIAG") ? atoi(getenv("SSBU_LOOSE_DIAG")) : 0;
     // ---- the plan: per fighter folder with files, its load group; then the loose files in no group
     int nn = 0, no_donor = 0;
-    g_lf_plan_count = 0; g_lf_group_count = 0;
+    g_lf_plan_count = 0; g_lf_group_count = 0; g_lf_pfix_count = 0;
+    for (int k = 0; k < g_lf_count; k++) g_lf[k].solo_plan = 0;
     static int8_t taken[LF_MAX];
     memset(taken, 0, sizeof taken);
     /* The groups are a work list: the costume group of every fighter folder with files is entered here; planning a
@@ -530,7 +675,7 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
             uint32_t dir_index = g->dir_index; int64_t dd = g->donor_dir;
             uint64_t drow = dirs + 0x34ull * (uint64_t)dd;
             uint32_t fs = lf_r32(drow + 0x20), fc = lf_r32(drow + 0x24);
-            if (dir_index >= n_ldir || (*(uint8_t *)(uintptr_t)(ldir + 0x48ull * dir_index + 8) & 1) || fs + fc > n_info || g_lf_plan_count + (int)fc > LF_MAX_NEW * 2 || nn + (int)fc > LF_MAX_NEW) {
+            if (dir_index >= n_ldir || (*(uint8_t *)(uintptr_t)(ldir + 0x48ull * dir_index + 8) & 1) || fs + fc > n_info || g_lf_plan_count + (int)fc > LF_MAX_PLAN || nn + (int)fc > LF_MAX_NEW) {
                 lf_logf("[loose] stage 2: %s: no free loaded-directory row at %u (length %u) or its range %u..+%u does not fit: NOT grown", npath, dir_index, n_ldir, fs, fc);
                 g_lf_group_count = 0; g_lf_plan_count = 0; return;
             }
@@ -698,7 +843,7 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
              * archive is appended to the costume group's range as a file of its own made from the template */
             if (g->path[0] != '(' && !g->is_link && t_ii != LF_NONE) {
                 char own_pre[96]; int lp = snprintf(own_pre, sizeof own_pre, "fighter/%s/", ow->name);
-                for (int q = 0; q < g_lf_count && nn < LF_MAX_NEW && g_lf_plan_count < LF_MAX_NEW * 2; q++) {
+                for (int q = 0; q < g_lf_count && nn < LF_MAX_NEW && g_lf_plan_count < LF_MAX_PLAN; q++) {
                     LooseFile *f = &g_lf[q];
                     int shared_brought = taken[q] == 3;         /* N9: a shared file of the group that the folder brings (see above) */
                     if (f->owner != o || f->path_index >= 0 || (taken[q] && !shared_brought) || strncmp(f->arc_path, own_pre, (size_t)lp)) continue;
@@ -801,13 +946,113 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
             }
         }
     }
+    /* MT: FILES ADDED TO AN EXISTING DIRECTORY (a plain mod folder's files under paths the archive does not have; their
+     * directory from config.json or the path, lf_plain_dirs): the directory's whole range is copied behind the archive's
+     * file infos as it is, a VIRTUAL record (N10: no bytes of the archive, filled at the raw-copy hook) is appended for
+     * each added file, and the directory row is switched to the copy IN PLACE (no new directory row; what
+     * reference\ARCropolis' add_files_to_directory does). Files of the range that a folder replaces are also served at
+     * their place in the copy (info_alt). These groups stand behind the new-fighter groups (n_newdir). */
+    int n_newdir = g_lf_group_count;
+    {
+        const char *tpx = getenv("SSBU_LOOSE_TEMPLATE"), *adde = getenv("SSBU_LOOSE_ADD");
+        int add_on = !(adde && adde[0] == '0') && (!tpx || !tpx[0] || tpx[0] == '3');
+        /* (file info << 32 | loose file), sorted: which loose files a copied row replaces, without a walk of all the
+         * loose files per row (with the merged pack: ~640 directories x ~500 rows x ~33000 files) */
+        uint64_t *byinfo = malloc(sizeof(uint64_t) * (size_t)(g_lf_count + 1)); int n_byinfo = 0;
+        for (int r = 0; byinfo && r < g_lf_count; r++) if (g_lf[r].path_index >= 0) byinfo[n_byinfo++] = (uint64_t)g_lf[r].info_index << 32 | (uint32_t)r;
+        if (byinfo) qsort(byinfo, (size_t)n_byinfo, sizeof *byinfo, lf_cmp_u64);
+        for (int q = 0; q < g_lf_count && add_on; q++) {
+            LooseFile *f = &g_lf[q];
+            if (f->owner >= 0 || !f->xdir || taken[q] || (f->path_index >= 0 && !f->shared)) continue;
+            int have = 0;
+            for (int x = n_newdir; x < g_lf_group_count; x++) if (g_lf_group[x].hash == f->xdir) have = 1;
+            if (have) continue;
+            int64_t dd = lf_bsearch(dirx, n_dir, f->xdir);
+            if (dd < 0) { lf_logf("[loose] %s (%u bytes): its directory %s is not a directory of the archive: NOT served", f->arc_path, f->size, f->xdir_path); taken[q] = 4; continue; }
+            uint64_t drow = dirs + 0x34ull * (uint64_t)dd;
+            uint32_t fs = lf_r32(drow + 0x20), fc = lf_r32(drow + 0x24);
+            if (g_lf_group_count >= LF_MAX_GROUPS || fs + fc > n_info || g_lf_plan_count + (int)fc + 1 > LF_MAX_PLAN || nn >= LF_MAX_NEW) {
+                lf_logf("[loose] %s: no room to extend directory %s (range %u..+%u): NOT served", f->arc_path, f->xdir_path, fs, fc); taken[q] = 4; continue;
+            }
+            uint32_t t_ii = LF_NONE, t_pi = 0, t_xi = 0;          /* the row copies' source: an own, non-regional file of the range */
+            for (uint32_t k = 0; k < fc && t_ii == LF_NONE; k++) {
+                uint64_t di = infos + 16ull * (fs + k);
+                uint32_t dpi = lf_r32(di) & 0xffffffu, dxi = lf_r32(di + 4);
+                if (dpi < n_path && dxi < n_ind && (lf_r32(ind + 8ull * dxi + 4) & 0xffffffu) == fs + k && !(lf_r32(di + 12) & 0x18000)) { t_ii = fs + k; t_pi = dpi; t_xi = dxi; }
+            }
+            if (t_ii == LF_NONE) { lf_logf("[loose] %s: directory %s has no own file to copy rows from: NOT served", f->arc_path, f->xdir_path); taken[q] = 4; continue; }
+            LooseGroup *g = &g_lf_group[g_lf_group_count++];
+            memset(g, 0, sizeof *g);
+            g->inplace = 1; g->hash = g->donor_hash = f->xdir; g->owner = -1; g->dir_index = g->donor_dir = (uint32_t)dd;
+            g->info_start = n_info + (uint32_t)g_lf_plan_count;
+            snprintf(g->path, sizeof g->path, "%s", f->xdir_path);
+            int moved = 0, added = 0;
+            for (uint32_t k = 0; k < fc; k++) {
+                g_lf_plan[g_lf_plan_count].donor_ii = fs + k; g_lf_plan[g_lf_plan_count].new_index = -1;
+                if (byinfo) {
+                    int lo = 0, hi = n_byinfo;
+                    while (lo < hi) { int mid = (lo + hi) / 2; if ((uint32_t)(byinfo[mid] >> 32) < fs + k) lo = mid + 1; else hi = mid; }
+                    for (; lo < n_byinfo && (uint32_t)(byinfo[lo] >> 32) == fs + k; lo++) { g_lf[(uint32_t)byinfo[lo]].info_alt = n_info + (uint32_t)g_lf_plan_count; moved++; }
+                } else {
+                    for (int r = 0; r < g_lf_count; r++) if (g_lf[r].path_index >= 0 && g_lf[r].info_index == fs + k) { g_lf[r].info_alt = n_info + (uint32_t)g_lf_plan_count; moved++; }
+                }
+                g_lf_plan_count++;
+            }
+            for (int r = q; r < g_lf_count && nn < LF_MAX_NEW && g_lf_plan_count < LF_MAX_PLAN; r++) {
+                LooseFile *a = &g_lf[r];
+                if (a->path_index >= 0 || a->owner >= 0 || a->xdir != f->xdir || taken[r]) continue;
+                char parent[400]; snprintf(parent, sizeof parent, "%s", a->arc_path); *strrchr(parent, '/') = 0;
+                int fa = lf_add_folder(parent, -1);
+                LooseNew *nw = &g_lf_new[nn];
+                memset(nw, 0, sizeof *nw);
+                nw->donor_pi = t_pi; nw->donor_xi = t_xi; nw->donor_ii = t_ii; nw->owner = -1; nw->loose = r; nw->kind = 5; nw->hash = a->hash;
+                nw->parent_hash = fa >= 0 ? g_lf_folder[fa].hash : lf_hash40(parent); nw->info_pos = n_info + (uint32_t)g_lf_plan_count;
+                taken[r] = 1;
+                g_lf_plan[g_lf_plan_count].donor_ii = t_ii; g_lf_plan[g_lf_plan_count].new_index = nn++;
+                g_lf_plan_count++; added++;
+            }
+            /* MT: a replaced SHARED file the directory does not list: its row is in a directory all slots share (Dedede's
+             * Waddle Dee: the 8 slots' paths lead to ONE row of a 22-file directory; pack Dedede c00 Totoro + c04 Tinkaton
+             * both wrote it in place, crash in f_71035ff340). The copy gets a row of its own for it (the shared row, named
+             * by the file's path), which the unsharing below finds like any entry of the directory. */
+            int listed = 0;
+            for (int r = q; r < g_lf_count && g_lf_plan_count < LF_MAX_PLAN && g_lf_pfix_count < LF_MAX_PFIX; r++) {
+                LooseFile *a = &g_lf[r];
+                if (a->path_index < 0 || !a->shared || a->xdir != f->xdir || (a->info_index >= fs && a->info_index < fs + fc)) continue;
+                int in = 0;
+                for (uint32_t k = 0; k < fc && !in; k++) in = (lf_r32(infos + 16ull * (fs + k)) & 0xffffffu) == (uint32_t)a->path_index;
+                if (in) continue;
+                g_lf_pfix[g_lf_pfix_count].plan = g_lf_plan_count; g_lf_pfix[g_lf_pfix_count++].path = (uint32_t)a->path_index;
+                g_lf_plan[g_lf_plan_count].donor_ii = a->info_index; g_lf_plan[g_lf_plan_count].new_index = -1;
+                g_lf_plan_count++; listed++;
+            }
+            if (listed) lf_logf("[loose] ADDED FILES: directory %s: + %d row(s) for replaced files whose shared row is in another directory (unshared below)", g->path, listed);
+            g->count = fc + (uint32_t)added + (uint32_t)listed;
+            g_lf_virtual = 1;
+            lf_logf("[loose] ADDED FILES: directory %s (row %lld): its %u file infos copied to %u.. (%d of them replaced by folders, served there too) + %d VIRTUAL record(s) for files the archive does not have",
+                    g->path, (long long)dd, fc, g->info_start, moved, added);
+        }
+        free(byinfo);
+    }
+    /* MT: a replaced SHARED file that no directory lists, requested singly (a fighter's sound banks: Kazuya's slots share
+     * one voice bank; pack Kazuya c02 Marge + c05 Kermitzuya both wrote it in place, the match never loaded): a row of
+     * its own outside any directory (the shared row, named by the file's path), unshared below like a directory entry */
+    int solo = 0;
+    for (int k = 0; k < g_lf_count && g_lf_plan_count < LF_MAX_PLAN && g_lf_pfix_count < LF_MAX_PFIX; k++) {
+        LooseFile *f = &g_lf[k];
+        if (f->path_index < 0 || !f->shared || f->xdir || strncmp(f->arc_path, "sound/", 6)) continue;
+        g_lf_pfix[g_lf_pfix_count].plan = g_lf_plan_count; g_lf_pfix[g_lf_pfix_count++].path = (uint32_t)f->path_index;
+        g_lf_plan[g_lf_plan_count].donor_ii = f->info_index; g_lf_plan[g_lf_plan_count].new_index = -1;
+        f->solo_plan = ++g_lf_plan_count; solo++;
+    }
+    if (solo) lf_logf("[loose] %d shared file(s) requested singly (sound banks): a row of their own each (unshared below)", solo);
     int standalone = 0, no_group = 0;
     for (int k = 0; k < g_lf_count; k++) {
         LooseFile *f = &g_lf[k];
         if (f->path_index >= 0 || f->owner < 0 || taken[k]) continue;
         int64_t d = f->donor_hash ? lf_find(arc, f->donor_hash) : -1;
         if (d < 0) { no_donor++; lf_logf("[loose] %s (%u bytes): not in the archive and no donor file (%llx): NOT served", f->arc_path, f->size, (unsigned long long)f->donor_hash); continue; }
-        if (nn >= LF_MAX_NEW || g_lf_plan_count >= LF_MAX_NEW * 2) break;
+        if (nn >= LF_MAX_NEW || g_lf_plan_count >= LF_MAX_PLAN) break;
         {   /* N7: a file row without a group is never read when the game expects the file from a group (N6 runs a3, b1),
              * and the donors of these files come with the SHARED stretch of the donor's group (the second directory-offset
              * row, which the new group shares) or by a request of their own. Until the shared stretch has rows of its own
@@ -835,8 +1080,10 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
         g_lf_plan_count++; standalone++;
         if (standalone <= 12) lf_logf("[loose] stage 2: %s: its donor file is in no group of %s: a file row without a group", f->arc_path, g_lf_owner[f->owner].name);
     }
-    if (!nn) { lf_logf("[loose] stage 2: no new paths"); return; }
-    int n_group = g_lf_group_count, n_newinfo = g_lf_plan_count;
+    int U = 0, RS = 0;
+    for (int k = 0; k < g_lf_count; k++) { if (g_lf[k].shared) U++; else if (g_lf[k].reshare && g_lf[k].path_index >= 0) RS++; }
+    if (!nn && !U && !RS) { lf_logf("[loose] stage 2: no new paths"); return; }
+    int n_group = n_newdir, n_newinfo = g_lf_plan_count;     /* MT: new directory rows only; the extended directories follow them in g_lf_group */
     // the group paths as folders of the search tables (when the donor's is one)
     for (int g = 0; g < n_group && !(diag & 4); g++)
         if (g_lf_group[g].path[0] != '(' && lf_bsearch(fidx, n_fold, g_lf_group[g].donor_hash) >= 0) lf_add_folder(g_lf_group[g].path, g_lf_group[g].owner);
@@ -868,8 +1115,8 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
     int n_sfile = 0;
     for (int j = 0; j < nn; j++) if (g_lf_new[j].kind != 3) n_sfile++;
     uint32_t add_p = (uint32_t)(n_sfile + new_fold);
-    uint8_t *paths2 = lf_grow_array(paths, n_path, (size_t)nn, 0x20), *ind2 = lf_grow_array(ind, n_ind, (size_t)nn, 8), *infos2 = lf_grow_array(infos, n_info, (size_t)n_newinfo, 16);
-    uint8_t *lfp2 = lf_grow_array(lfp, n_lfp, (size_t)nn, 8), *ld2 = lf_grow_array(ld, n_ld, (size_t)nn, 0x18);
+    uint8_t *paths2 = lf_grow_array(paths, n_path, (size_t)nn + U + RS, 0x20), *ind2 = lf_grow_array(ind, n_ind, (size_t)nn + U + RS, 8), *infos2 = lf_grow_array(infos, n_info, (size_t)n_newinfo + U + RS, 16);
+    uint8_t *lfp2 = lf_grow_array(lfp, n_lfp, (size_t)nn + U + RS, 8), *ld2 = lf_grow_array(ld, n_ld, (size_t)nn + U + RS, 0x18);
     uint8_t *ent2 = VirtualAlloc(NULL, ((size_t)n_ent + nn) * 8 + 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     uint8_t *buck2 = lf_grow_array(buckets, (size_t)nb + 1, 0, 8);
     uint8_t *dirs2 = lf_grow_array(dirs, n_dir, (size_t)n_group, 0x34), *dirx2 = lf_grow_array(dirx, n_dir, (size_t)n_group, 8);
@@ -884,8 +1131,10 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
     // ---- file infos in the planned order: a new file's row, or the donor's row as it is
     int raised = 0, regional = 0, n_tmpl = 0;
     uint32_t n_i2d = lf_r32(hdr + 0x1c) + lf_r32(hdr + 0x28) + lf_r32(hdr + 0x50), n_datas = lf_r32(hdr + 0x20) + lf_r32(hdr + 0x28) + lf_r32(hdr + 0x54);
-    for (int q = 0; q < n_newinfo; q++) {
+    for (int q = 0, pf = 0; q < n_newinfo; q++) {
         memcpy(infos2 + 16ull * (n_info + (uint32_t)q), (void *)(uintptr_t)(infos + 16ull * g_lf_plan[q].donor_ii), 16);
+        for (; pf < g_lf_pfix_count && g_lf_pfix[pf].plan <= q; pf++)
+            if (g_lf_pfix[pf].plan == q) P32(infos2, 16ull * (n_info + (uint32_t)q)) = (P32(infos2, 16ull * (n_info + (uint32_t)q)) & 0xff000000u) | g_lf_pfix[pf].path;
         if (g_lf_plan[q].new_index < 0) continue;
         int j = g_lf_plan[q].new_index;
         LooseNew *nw = &g_lf_new[j];
@@ -943,7 +1192,7 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
             }
             f->path_index = (int32_t)pi; f->indice_index = xi; f->info_index = ii; f->is_new = 2; f->data_index = n_datas + (uint32_t)n_tmpl;
             f->arc_size = g_lf_tmpl[n_tmpl].size;
-            g_lf_owner[f->owner].new_files++;
+            if (f->owner >= 0) g_lf_owner[f->owner].new_files++;
             n_tmpl++;
         } else if (f) {
             f->path_index = (int32_t)pi; f->indice_index = xi; f->info_index = ii; f->is_new = 1; f->data_index = data_index;
@@ -956,8 +1205,8 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
     }
     // ---- N8: the info-to-data and file-data rows of the files made from a template (after the size raises above)
     uint8_t *to_data2 = NULL, *datas2 = NULL;
-    if (n_tmpl) {
-        to_data2 = lf_grow_array(to_data, n_i2d, (size_t)n_tmpl, 12); datas2 = lf_grow_array(datas, n_datas, (size_t)n_tmpl, 16);
+    if (n_tmpl || U || RS) {
+        to_data2 = lf_grow_array(to_data, n_i2d, (size_t)n_tmpl + (size_t)U * (2 + LF_XINFO) + RS, 12); datas2 = lf_grow_array(datas, n_datas, (size_t)n_tmpl + 2 * (size_t)U + RS, 16);
         if (!to_data2 || !datas2) { lf_logf("[loose] stage 2: no memory: NOT grown"); return; }
         for (int e = 0; e < n_tmpl; e++) {
             memcpy(to_data2 + 12ull * (n_i2d + (uint32_t)e), (void *)(uintptr_t)(to_data + 12ull * g_lf_tmpl[e].itd), 12);
@@ -975,7 +1224,276 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
         lf_logf("[loose] stage 2: %d file(s) made from a template: info-to-data rows %u -> %u, file-data rows %u -> %u (each with the folder file's size)", n_tmpl, n_i2d, n_i2d + (uint32_t)n_tmpl,
                 n_datas, n_datas + (uint32_t)n_tmpl);
     }
+    /* ---- MT: UNSHARING. A replaced file whose path shares another path's data: in the archive both slots' directory
+     * entries lead to ONE record of the fighter's SHARED group (its own stretch, loaded as a group of its own; e.g. Banjo's
+     * partner model c00 / c01 -> one record), so two mods on the two slots wrote one buffer (run mtb pairs b001: crash in the
+     * loader). A separate chain behind the tables is never loaded by anything (run mtb b001 #2: the match load never ended).
+     * So the file's entry in the COPIED range of its own slot directory (an extended directory, planned above) becomes a
+     * VIRTUAL record (N10: no bytes of the archive, filled at the raw-copy hook) with an indice row of its own, and the path
+     * row leads to that indice. The shared record stays the archive's: the other slots keep the vanilla file. */
+    int unshared = 0, u_entry = 0, n_rs = 0;                 /* MT: n_rs = paths made for shared pool rows (below) */
+    uint32_t *u_paths = U ? malloc(sizeof(uint32_t) * (size_t)U) : NULL, *u_xi = U ? malloc(sizeof(uint32_t) * (size_t)U) : NULL;
+    if (U && u_paths && u_xi && to_data2 && datas2) {
+        /* every file info row of each shared file's path, in ONE pass over the rows (a pass per file took seconds with
+         * the merged pack): the candidates for its entries in other directories, below */
+        uint32_t (*xc)[LF_XINFO + 2] = calloc((size_t)g_lf_count, sizeof *xc); uint8_t *xcn = calloc((size_t)g_lf_count, 1);
+        const uint32_t n_dirinfo = lf_r32(hdr + 0x18);           /* file infos of directories; the shared pool follows */
+        uint32_t hcap = 1024; while (hcap < (uint32_t)U * 4) hcap <<= 1;
+        uint32_t *hkey = calloc(hcap, sizeof *hkey); int32_t *hval = calloc(hcap, sizeof *hval);
+        if (xc && xcn && hkey && hval) {
+            for (int k = 0; k < g_lf_count; k++) {
+                if (!g_lf[k].shared) continue;
+                uint32_t key = (uint32_t)g_lf[k].path_index + 1, h = (key * 2654435761u) & (hcap - 1);
+                while (hkey[h] && hkey[h] != key) h = (h + 1) & (hcap - 1);
+                if (!hkey[h]) { hkey[h] = key; hval[h] = k; }
+            }
+            for (uint32_t r = 0; r < n_info + (uint32_t)g_lf_plan_count; r++) {
+                const uint8_t *xr = infos2 + 16ull * r;
+                if (P32(xr, 12) & 0x18000) continue;
+                uint32_t key = (P32(xr, 0) & 0xffffffu) + 1, h = (key * 2654435761u) & (hcap - 1);
+                while (hkey[h] && hkey[h] != key) h = (h + 1) & (hcap - 1);
+                if (hkey[h] && xcn[hval[h]] < LF_XINFO + 2) xc[hval[h]][xcn[hval[h]]++] = r;
+            }
+        } else { free(xc); free(xcn); xc = NULL; xcn = NULL; }
+        free(hkey); free(hval);
+        for (int k = 0; k < g_lf_count; k++) {
+            LooseFile *f = &g_lf[k];
+            if (!f->shared) continue;
+            uint32_t pi = (uint32_t)f->path_index; int q = -1; LooseGroup *gq = NULL;
+            for (int x = n_newdir; x < g_lf_group_count && q < 0; x++) {
+                LooseGroup *gr = &g_lf_group[x];
+                if (gr->hash != f->xdir) continue;
+                for (uint32_t r = 0; r < gr->count; r++) {
+                    uint32_t at = gr->info_start + r - n_info;
+                    if (g_lf_plan[at].new_index == -1 && (P32(infos2, 16ull * gr->info_start + 16ull * r) & 0xffffffu) == pi) { q = (int)at; gq = gr; break; }
+                }
+            }
+            if (q < 0 && f->solo_plan) q = f->solo_plan - 1;
+            if (q < 0) { lf_logf("[loose] %s: shares its data with another slot, and no entry of it in an extended directory (%s): NOT unshared, replaced in place", f->arc_path, f->xdir_path ? f->xdir_path : "no directory"); continue; }
+            uint32_t ii = n_info + (uint32_t)q, xi = n_ind + (uint32_t)nn + (uint32_t)unshared;
+            uint32_t itd = n_i2d + (uint32_t)n_tmpl + (uint32_t)unshared, dd = n_datas + (uint32_t)n_tmpl + (uint32_t)unshared;
+            uint8_t *row = infos2 + 16ull * ii;
+            uint32_t x0 = P32(row, 4), itd0 = P32(row, 8);
+            const char *e5 = strrchr(f->arc_path, '.'); e5 = e5 ? e5 + 1 : "";
+            memcpy(to_data2 + 12ull * itd, (void *)(uintptr_t)(to_data + 12ull * itd0), 12);
+            P32(to_data2, 12ull * itd + 4) = dd; P32(to_data2, 12ull * itd + 8) = ii | 0x01000000u;          /* load type 1: a group's own file, this record */
+            if (!gq) P32(to_data2, 12ull * itd + 8) = ii | (lf_r32(to_data + 12ull * itd0 + 8) & 0xff000000u);       /* requested singly: its own load type */
+            memset(datas2 + 16ull * dd, 0, 16); P32(datas2, 16ull * dd + 8) = f->size;                        /* {offset 0, compressed 0, size, raw} */
+            P32(row, 4) = xi; P32(row, 8) = itd;
+            P32(row, 12) = (!strcmp(e5, "nutexb") || !strcmp(e5, "eff")) ? 0x1000u : (P32(row, 12) & 0x7fffu);
+            P32(ind2, 8ull * xi) = (uint32_t)(lf_r64(dirs + 0x34ull * g_lf_group[n_newdir].dir_index) >> 40) & 0xffffffu;
+            for (int x = n_newdir; x < g_lf_group_count; x++) if (g_lf_group[x].hash == f->xdir) P32(ind2, 8ull * xi) = (uint32_t)(lf_r64(dirs + 0x34ull * g_lf_group[x].dir_index) >> 40) & 0xffffffu;
+            if (!gq) P32(ind2, 8ull * xi) = lf_r32(ind + 8ull * x0);                                            /* requested singly: the shared indice's own */
+            P32(ind2, 8ull * xi + 4) = ii | (lf_r32(ind + 8ull * x0 + 4) & 0xff000000u);
+            memset(ld2 + 0x18ull * xi, 0, 0x18);
+            /* MT: a row of the shared pool that names this path (pack Murabito c01 Parappa's def_murabito_002_col: pool row
+             * 0x93ef5): every slot's load of the shared group follows that row by its PATH; with the path row led to the
+             * virtual record (filled only when this slot loads), every other Villager slot's load never ended. Such a row gets
+             * a path of its own (a copy of this one with an impossible length, so it matches no hash: ARCropolis'
+             * reshare_dependent_files) that keeps the shared record; this path then leads to the virtual record as usual. */
+            uint32_t rs_path = 0;
+            for (int c2 = 0; xc && c2 < xcn[k]; c2++) {
+                uint32_t r = xc[k][c2];
+                if (r < n_dirinfo || r >= n_info) continue;
+                if (!rs_path) {
+                    rs_path = n_path + (uint32_t)nn + (uint32_t)n_rs++;
+                    memcpy(paths2 + 0x20ull * rs_path, paths2 + 0x20ull * pi, 0x20);
+                    P64(paths2, 0x20ull * rs_path) = (P64(paths2, 0x20ull * pi) & 0xffffffffull) | (0xffull << 32) | ((uint64_t)x0 << 40);
+                    memset(lfp2 + 8ull * rs_path, 0, 8);
+                }
+                P32(infos2, 16ull * r) = (P32(infos2, 16ull * r) & 0xff000000u) | rs_path;
+            }
+            if (rs_path && (n_rs <= 3 || getenv("SSBU_LOOSE_VERBOSE")))
+                lf_logf("[loose] UNSHARED %s: shared pool rows name its path: they get a path of their own (0x%x) on the shared record", f->arc_path, rs_path);
+            P64(paths2, 0x20ull * pi) = (P64(paths2, 0x20ull * pi) & LF_MASK40) | ((uint64_t)xi << 40);
+            g_lf_plan[q].new_index = -2;                                                                       /* served at the raw-copy hook like a virtual record */
+            /* MT: lf_resolve raised the SHARED record's size to the loose file's: the other slots load the vanilla bytes from
+             * it, and with the larger size their load never ended (pack Demon c02 Marge + c05 Kermitzuya: c05's
+             * alp_demon_003_col.nutexb, 19120 -> 24240 on the record all 8 slots share; no fight). It gets the archive's
+             * size back (files still replaced in place raise it again below). */
+            if (f->data_index < n_datas) P32(datas2, 16ull * f->data_index + 8) = f->arc_size;
+            f->indice_index = xi; f->info_index = ii; f->data_index = dd; f->info_alt = 0; f->arc_size = f->size;
+            /* the path's entries in OTHER directories: the Pokemon Trainer's directories (fighter/ptrainer/cNN and
+             * ptrainer_low/cNN) list its Pokemon's files too and load them first; left on the shared record they loaded the
+             * vanilla file, and the path's own lookup found its new indice not loaded (run mtb_b038: "buffer 0", modded mesh
+             * with the vanilla skeleton, crash in f_7103892d30). Each such entry leads to the same virtual record, through
+             * an info-to-data row of its own (which names its file info). */
+            f->nx = 0;
+            /* the OTHER slots' directories of the same fighter (fighter/<f>/cMM): their rows that name this path are
+             * those slots' own (Corrin's c03 lists the c04 mesh as its second row: led to the c04 mod's record, pack
+             * Kamui c03 Korra + c04 Orochimaru loaded the c04 file beside the c03 skeleton, crash in f_71035ff340) */
+            uint32_t sib_fs[8], sib_fc[8]; uint64_t sib_h[8]; int n_sib = 0;
+            /* MT: and the file's OWN directory's original range: the directory now reads its copied range, and an original
+             * row is only reached through a shared pool row that links to it (pack Murabito c01 Parappa's
+             * def_murabito_002_col: its pool row 0x93ef5 links to c01's original row 0x56344; led to the virtual record,
+             * every Villager slot's load never ended) */
+            uint32_t own_fs = 0, own_fc = 0;
+            if (gq) { int64_t od = lf_bsearch(dirx, n_dir, f->xdir); if (od >= 0) { own_fs = lf_r32(dirs + 0x34ull * (uint64_t)od + 0x20); own_fc = lf_r32(dirs + 0x34ull * (uint64_t)od + 0x24); } }
+            {
+                const char *xp = f->xdir_path ? f->xdir_path : ""; size_t xl = strlen(xp);
+                if (!strncmp(xp, "fighter/", 8) && xl > 12 && xp[xl - 4] == '/' && xp[xl - 3] == 'c' && xp[xl - 2] >= '0' && xp[xl - 2] <= '9' && xp[xl - 1] >= '0' && xp[xl - 1] <= '9') {
+                    for (int s = 0; s < 8; s++) {
+                        char sp[128]; snprintf(sp, sizeof sp, "%.*sc%02d", (int)(xl - 3), xp, s);
+                        uint64_t sh = lf_hash40(sp);
+                        if (sh == f->xdir) continue;
+                        int64_t sd = lf_bsearch(dirx, n_dir, sh);
+                        if (sd < 0) continue;
+                        sib_h[n_sib] = sh; sib_fs[n_sib] = lf_r32(dirs + 0x34ull * (uint64_t)sd + 0x20); sib_fc[n_sib] = lf_r32(dirs + 0x34ull * (uint64_t)sd + 0x24); n_sib++;
+                    }
+                }
+            }
+            static int xdir_on = -1; if (xdir_on < 0) xdir_on = !(getenv("SSBU_LOOSE_XDIR") && !atoi(getenv("SSBU_LOOSE_XDIR")));      /* TEST: =0 other directories' entries stay on the shared record */
+            for (int c2 = 0; xdir_on && xc && c2 < xcn[k]; c2++) {
+                uint32_t r = xc[k][c2];
+                uint8_t *xr = infos2 + 16ull * r;
+                if (r == ii) continue;
+                if (r >= n_info && g_lf_plan[r - n_info].new_index == -2) continue;           /* another unshared file's already */
+                int sib = 0;
+                for (int s = 0; s < n_sib && !sib; s++) {
+                    if (r >= sib_fs[s] && r < sib_fs[s] + sib_fc[s]) sib = 1;
+                    for (int x = n_newdir; x < g_lf_group_count && !sib; x++)
+                        if (g_lf_group[x].hash == sib_h[s] && r >= g_lf_group[x].info_start && r < g_lf_group[x].info_start + g_lf_group[x].count) sib = 1;
+                }
+                if (sib || (r >= own_fs && r < own_fs + own_fc)) continue;
+                /* only rows of a directory (the first section of the file infos): a row of the shared pool after it is
+                 * the record of OTHER paths too (a vanilla model.xmb that 352 directories share: Raiden / Steve /
+                 * Shadow Queen); led to the virtual record, those paths' loads never finished (main thread spinning in
+                 * f_71038ffa80) */
+                if (r >= n_dirinfo && r < n_info) continue;
+                if (f->nx == LF_XINFO) { lf_logf("[loose] %s: more than %d other directory entries (%d rows name its path): the rest stay on the shared record", f->arc_path, LF_XINFO, (int)xcn[k]); break; }
+                uint32_t itx = n_i2d + (uint32_t)n_tmpl + (uint32_t)U + (uint32_t)(unshared * LF_XINFO + f->nx);
+                memcpy(to_data2 + 12ull * itx, to_data2 + 12ull * itd, 12);
+                P32(to_data2, 12ull * itx + 8) = r | 0x01000000u;
+                P32(xr, 4) = xi; P32(xr, 8) = itx; P32(xr, 12) = P32(row, 12);
+                f->info_x[f->nx++] = r;
+            }
+            /* MT: the slot directory's OTHER entries on the same shared record: each Diddy slot lists its body mesh twice (a
+             * second row, flags 0x300010, under another path). Left on the shared record, that row loaded whatever is there:
+             * with another slot's mod owning the record (pack Diddy c03 Mankey + c04 Chimpanzee), the c04 mesh beside the c03
+             * skeleton, crash in f_7103541e10. They lead to this virtual record too. */
+            int nsame = 0;
+            for (uint32_t r2 = 0; gq && r2 < gq->count; r2++) {
+                uint32_t r = gq->info_start + r2, at = r - n_info;
+                uint8_t *xr = infos2 + 16ull * r;
+                if (r == ii || P32(xr, 4) != x0 || g_lf_plan[at].new_index != -1 || lf_is_xinfo(f, r)) continue;
+                if (f->nx == LF_XINFO) { lf_logf("[loose] %s: more than %d other entries on its shared record: the rest stay there", f->arc_path, LF_XINFO); break; }
+                uint32_t itx = n_i2d + (uint32_t)n_tmpl + (uint32_t)U + (uint32_t)(unshared * LF_XINFO + f->nx);
+                memcpy(to_data2 + 12ull * itx, to_data2 + 12ull * itd, 12);
+                P32(to_data2, 12ull * itx + 8) = r | 0x01000000u;
+                P32(xr, 4) = xi; P32(xr, 8) = itx; P32(xr, 12) = P32(row, 12);
+                g_lf_plan[at].new_index = -2;                                                                  /* served at the raw-copy hook */
+                f->info_x[f->nx++] = r; nsame++;
+            }
+            if (nsame && (g_lf_samedir++ < 3 || getenv("SSBU_LOOSE_VERBOSE")))
+                lf_logf("[loose] UNSHARED %s: %d more entr%s of %s on the same shared record led to its virtual record too", f->arc_path, nsame, nsame == 1 ? "y" : "ies", f->xdir_path);
+            if (f->nx && (unshared < 3 || getenv("SSBU_LOOSE_VERBOSE")))
+                lf_logf("[loose] UNSHARED %s: %d entr%s in other directories led to its virtual record too (first: file info 0x%x)", f->arc_path, f->nx, f->nx == 1 ? "y" : "ies", f->info_x[0]);
+            /* MT (SSBU_LOOSE_STANDALONE, default 1; 0 = off): the new indice's directory word 0xffffff, a file of no directory (ARCropolis'
+             * unshare_file: dir_offset_index 0xff_ffff): Joker's results ask for Mona's unshared files on their own after
+             * the fight released them, and the load never started. 1 (default): files other directories list too (nx), 2: all */
+            static int sa_on = -1; if (sa_on < 0) sa_on = getenv("SSBU_LOOSE_STANDALONE") ? atoi(getenv("SSBU_LOOSE_STANDALONE")) : 1;
+            if (sa_on == 2 || (sa_on == 1 && f->nx)) {
+                P32(ind2, 8ull * xi) = LF_NONE; f->standalone = 1; g_lf_sa_count++;
+                /* asked for on its own, the load loop reads the record's compressed size from the archive and the inflate
+                 * thread copies the file from that read: with the virtual record's 0 bytes the inflate thread waited for
+                 * the rest of a file larger than its window (Mona's numshb, 1180096 bytes) and the loading stopped. So the
+                 * indice leads to a file info of its own (the spare row behind the new ones) on a raw record the file long
+                 * (offset 0 of the same folder: bytes the copy hook replaces); the group's batch keeps the virtual record. */
+                uint32_t i1 = n_info + (uint32_t)n_newinfo + (uint32_t)unshared, t1 = n_i2d + (uint32_t)n_tmpl + (uint32_t)U * (1 + LF_XINFO) + (uint32_t)RS + (uint32_t)unshared;
+                uint32_t d1 = n_datas + (uint32_t)n_tmpl + (uint32_t)U + (uint32_t)RS + (uint32_t)unshared;
+                memcpy(infos2 + 16ull * i1, row, 16); P32(infos2, 16ull * i1 + 8) = t1;
+                memcpy(to_data2 + 12ull * t1, to_data2 + 12ull * itd, 12); P32(to_data2, 12ull * t1 + 4) = d1;
+                P32(to_data2, 12ull * t1 + 8) = i1 | (P32(to_data2, 12ull * itd + 8) & 0xff000000u);
+                memset(datas2 + 16ull * d1, 0, 16); P32(datas2, 16ull * d1 + 4) = f->size; P32(datas2, 16ull * d1 + 8) = f->size;
+                P32(ind2, 8ull * xi + 4) = i1 | (P32(ind2, 8ull * xi + 4) & 0xff000000u);
+                f->info_single = i1;
+                f->sa_dir = gq ? gq->dir_index : LF_NONE;
+            }
+            u_paths[unshared] = pi; u_xi[unshared] = xi; u_entry++;
+            if (unshared < 3 || getenv("SSBU_LOOSE_VERBOSE"))
+                lf_logf("[loose] UNSHARED %s: its entry in %s (file info 0x%x) is now a VIRTUAL record of its own (indice 0x%x, data 0x%x); the shared record stays the archive's", f->arc_path, f->xdir_path, ii, xi, dd);
+            unshared++;
+        }
+        free(xc); free(xcn);
+        for (int k = 0; k < g_lf_count; k++) {                   /* MT: files on the archive's records: their raised sizes (above) */
+            LooseFile *f = &g_lf[k];
+            if (f->path_index >= 0 && f->data_index < n_datas && f->size > P32(datas2, 16ull * f->data_index + 8)) P32(datas2, 16ull * f->data_index + 8) = f->size;
+            for (int r = 0; f->path_index >= 0 && r < f->nr; r++) if (f->rdi[r] < n_datas && f->size > P32(datas2, 16ull * f->rdi[r] + 8)) P32(datas2, 16ull * f->rdi[r] + 8) = f->size;
+        }
+        lf_logf("[loose] %d file(s) unshared (%d with a directory entry)", unshared, u_entry);
+        if (unshared) g_lf_virtual = 1;
+    }
+    /* ---- MT: RESHARING (ARCropolis' reshare_dependent_files). A replaced file whose own directory row OTHER slots' paths
+     * lead to (they share its indice, so its buffer: Dedede's Waddle Dee / Gordo / Shrine / Jet Hammer models, all 8 slots
+     * on c00's rows; pack Dedede c00 Totoro replaced them for every slot, c04 Tinkaton's meshes loaded beside Totoro's
+     * skeletons: crash in the model loader). Unsharing the owner instead left the other slots' loads waiting (Trainer c00
+     * TF2 Engineer). So the owner stays replaced in place, and ONE vanilla chain is made beside it: a path (the owner's with
+     * an impossible length: it matches no hash), an indice, a file info (the owner's row), an info-to-data row and a file-data
+     * row with the ARCHIVE's size. Every other path and row on the owner's indice is led to the new indice; an info-to-data
+     * row that names that indice (load type 0: read singly through it) names the new one; one that reads the owner's
+     * file-data row itself reads the copy (the owner's has the loose file's size). */
+    int n_rsh = 0, rsh_paths = 0, rsh_rows = 0;
+    if (RS && to_data2 && datas2) {
+        uint32_t base_x = n_ind + (uint32_t)nn + (uint32_t)unshared, base_p = n_path + (uint32_t)nn + (uint32_t)n_rs, base_i = n_info + (uint32_t)n_newinfo + (uint32_t)U;
+        uint32_t base_t = n_i2d + (uint32_t)n_tmpl + (uint32_t)U * (1 + LF_XINFO), base_d = n_datas + (uint32_t)n_tmpl + (uint32_t)U;
+        uint32_t hc = 64; while (hc < (uint32_t)RS * 4) hc <<= 1;
+        uint32_t *hk = calloc(hc, sizeof *hk); int *hv = calloc(hc, sizeof *hv);
+        uint32_t *o_pi = calloc((size_t)RS, 4), *o_data = calloc((size_t)RS, 4);
+        if (hk && hv && o_pi && o_data) {
+            for (int k = 0; k < g_lf_count; k++) {
+                LooseFile *f = &g_lf[k];
+                if (!f->reshare || f->shared || f->path_index < 0 || n_rsh == RS) continue;
+                uint32_t pi = (uint32_t)f->path_index, X = (uint32_t)(P64(paths2, 0x20ull * pi) >> 40), R = P32(ind2, 8ull * X + 4) & 0xffffffu;
+                if (R >= n_info) continue;
+                int j = n_rsh;
+                uint32_t xk = base_x + (uint32_t)j, pk = base_p + (uint32_t)j, ik = base_i + (uint32_t)j, tk = base_t + (uint32_t)j, dk = base_d + (uint32_t)j;
+                uint32_t tR = P32(infos2, 16ull * R + 8), dR = P32(to_data2, 12ull * tR + 4);
+                memcpy(paths2 + 0x20ull * pk, paths2 + 0x20ull * pi, 0x20);
+                P64(paths2, 0x20ull * pk) = (P64(paths2, 0x20ull * pi) & 0xffffffffull) | (0xffull << 32) | ((uint64_t)xk << 40);
+                memset(lfp2 + 8ull * pk, 0, 8);
+                memcpy(infos2 + 16ull * ik, infos2 + 16ull * R, 16);
+                P32(infos2, 16ull * ik) = (P32(infos2, 16ull * R) & 0xff000000u) | pk; P32(infos2, 16ull * ik + 4) = xk; P32(infos2, 16ull * ik + 8) = tk;
+                memcpy(to_data2 + 12ull * tk, to_data2 + 12ull * tR, 12); P32(to_data2, 12ull * tk + 4) = dk;
+                memcpy(datas2 + 16ull * dk, datas2 + 16ull * dR, 16); P32(datas2, 16ull * dk + 8) = f->arc_size;
+                P32(ind2, 8ull * xk) = P32(ind2, 8ull * X); P32(ind2, 8ull * xk + 4) = (P32(ind2, 8ull * X + 4) & 0xff000000u) | ik;
+                memset(ld2 + 0x18ull * xk, 0, 0x18);
+                o_pi[j] = pi; o_data[j] = dR;
+                uint32_t key = X + 1, h = (key * 2654435761u) & (hc - 1);
+                while (hk[h] && hk[h] != key) h = (h + 1) & (hc - 1);
+                hk[h] = key; hv[h] = j; n_rsh++;
+                if (n_rsh <= 3 || getenv("SSBU_LOOSE_VERBOSE"))
+                    lf_logf("[loose] RESHARED %s: replaced in place; the other paths on its indice 0x%x get a vanilla copy (indice 0x%x, file info 0x%x, data 0x%x, %u bytes)", f->arc_path, X, xk, ik, dk, f->arc_size);
+            }
+#define RSH_FIND(x_, j_) do { uint32_t key_ = (x_) + 1, h_ = (key_ * 2654435761u) & (hc - 1); j_ = -1; \
+                while (hk[h_]) { if (hk[h_] == key_) { j_ = hv[h_]; break; } h_ = (h_ + 1) & (hc - 1); } } while (0)
+            for (uint32_t p = 0; p < n_path; p++) {
+                int j; RSH_FIND((uint32_t)(P64(paths2, 0x20ull * p) >> 40), j);
+                if (j < 0 || p == o_pi[j]) continue;
+                P64(paths2, 0x20ull * p) = (P64(paths2, 0x20ull * p) & LF_MASK40) | ((uint64_t)(base_x + (uint32_t)j) << 40); rsh_paths++;
+            }
+            for (uint32_t r = 0; r < n_info + (uint32_t)g_lf_plan_count; r++) {
+                uint8_t *xr = infos2 + 16ull * r;
+                int j; RSH_FIND(P32(xr, 4), j);
+                if (j < 0 || (P32(xr, 0) & 0xffffffu) == o_pi[j]) continue;
+                uint32_t xk = base_x + (uint32_t)j, t = P32(xr, 8);
+                P32(xr, 4) = xk; rsh_rows++;
+                if (t < n_i2d + (uint32_t)n_tmpl) {
+                    uint32_t w2 = P32(to_data2, 12ull * t + 8);
+                    int j2; RSH_FIND(w2 & 0xffffffu, j2);
+                    if (!(w2 >> 24) && j2 == j) P32(to_data2, 12ull * t + 8) = (w2 & 0xff000000u) | xk;
+                    if (P32(to_data2, 12ull * t + 4) == o_data[j]) P32(to_data2, 12ull * t + 4) = base_d + (uint32_t)j;
+                }
+            }
+#undef RSH_FIND
+            lf_logf("[loose] %d file(s) reshared: %d other paths and %d file infos led to their vanilla copies", n_rsh, rsh_paths, rsh_rows);
+        }
+        free(hk); free(hv); free(o_pi); free(o_data);
+    }
     // ---- the directory rows of the groups
+    for (int g = n_newdir; g < g_lf_group_count; g++) {          /* MT: an extended directory: its own row, switched to the copied range */
+        uint8_t *nr = dirs2 + 0x34ull * g_lf_group[g].dir_index;
+        P32(nr, 0x20) = g_lf_group[g].info_start; P32(nr, 0x24) = g_lf_group[g].count;
+    }
     for (int g = 0; g < n_group; g++) {
         LooseGroup *gr = &g_lf_group[g];
         const uint8_t *dr = (const uint8_t *)(uintptr_t)(dirs + 0x34ull * gr->donor_dir);
@@ -1087,6 +1605,7 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
      * stand behind the old ones and are not touched. */
     memcpy(ld2, (void *)(uintptr_t)ld, (size_t)n_ld * 0x18);
     memcpy(lfp2, (void *)(uintptr_t)lfp, (size_t)n_lfp * 8);
+    for (int u = 0; u < unshared; u++) if (!P32(lfp2, 8ull * u_paths[u] + 4)) P32(lfp2, 8ull * u_paths[u]) = u_xi[u];      /* MT: an unshared path's loaded row names its own indice (not loaded yet) */
     for (int a = 0; a < 2; a++) {
         g_lf_sync[a].snap = VirtualAlloc(NULL, g_lf_sync[a].count * g_lf_sync[a].item + 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         memcpy(g_lf_sync[a].snap, g_lf_sync[a].now, g_lf_sync[a].count * g_lf_sync[a].item);      /* what was copied, not what the old array holds by now */
@@ -1101,14 +1620,14 @@ static void lf_grow(uint64_t fsinfo, uint64_t arc) {
     g_lf_first_new_info = n_info;
     lf_w64(arc + 0x60, (uint64_t)(uintptr_t)paths2); lf_w64(arc + 0x68, (uint64_t)(uintptr_t)ind2); lf_w64(arc + 0x90, (uint64_t)(uintptr_t)infos2);
     lf_w64(arc + 0x78, (uint64_t)(uintptr_t)dirs2);
-    if (n_tmpl) { lf_w64(arc + 0x98, (uint64_t)(uintptr_t)to_data2); lf_w64(arc + 0xa0, (uint64_t)(uintptr_t)datas2); }
+    if (n_tmpl || unshared || n_rsh) { lf_w64(arc + 0x98, (uint64_t)(uintptr_t)to_data2); lf_w64(arc + 0xa0, (uint64_t)(uintptr_t)datas2); }
     if (g_lf_fo_count) lf_w64(arc + 0x80, (uint64_t)(uintptr_t)fo2);
     if (g_lf_child_count) lf_w64(arc + 0x88, (uint64_t)(uintptr_t)childh2);
     lf_w64(fsinfo + 8, (uint64_t)(uintptr_t)lfp2); lf_w64(fsinfo + 0x10, (uint64_t)(uintptr_t)ld2);
-    lf_w32(hdr + 4, n_path + (uint32_t)nn); lf_w32(hdr + 8, n_ind + (uint32_t)nn);
+    lf_w32(hdr + 4, n_path + (uint32_t)nn + (uint32_t)n_rs + (uint32_t)n_rsh); lf_w32(hdr + 8, n_ind + (uint32_t)nn + (uint32_t)unshared + (uint32_t)n_rsh);
     /* the header's file info count (+0x18) is NOT raised: the new infos stand behind all three parts of the array (the
      * count is the first part's length, and the other parts are addressed behind it) */
-    lf_w32(fsinfo + 0x18, n_lfp + (uint32_t)nn); lf_w32(fsinfo + 0x1c, n_ld + (uint32_t)nn);
+    lf_w32(fsinfo + 0x18, n_lfp + (uint32_t)nn + (uint32_t)n_rs + (uint32_t)n_rsh); lf_w32(fsinfo + 0x1c, n_ld + (uint32_t)nn + (uint32_t)unshared + (uint32_t)n_rsh);
     const char *part = getenv("SSBU_LOOSE_STAGE2");            /* diagnosis: "files" = the file tables only, "search" = the search tables only */
     int do_files = !(part && part[0] == 's'), do_search = !(part && part[0] == 'f');
     if (do_files) {
@@ -1167,6 +1686,29 @@ static void lf_resolve(uint64_t fsinfo, uint64_t arc) {
     uint64_t infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0);
     uint32_t n = lf_r32(header + 4);
     int found = 0, pending = 0;
+    /* MT: the indice rows that more than one file path leads to (other slots' paths on this file's data): one pass over the
+     * paths, for the owner case below */
+    uint32_t ocap = 1024; while (ocap < (uint32_t)g_lf_count * 4) ocap <<= 1;
+    uint32_t *okey = calloc(ocap, sizeof *okey); uint16_t *ocnt = calloc(ocap, sizeof *ocnt);
+    if (okey && ocnt) {
+        for (int k = 0; k < g_lf_count; k++) {
+            int64_t i = lf_find(arc, g_lf[k].hash); if (i < 0) continue;
+            uint32_t key = (uint32_t)(lf_r64(paths + 0x20ull * (uint64_t)i) >> 40) + 1, h = (key * 2654435761u) & (ocap - 1);
+            while (okey[h] && okey[h] != key) h = (h + 1) & (ocap - 1);
+            okey[h] = key;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t key = (uint32_t)(lf_r64(paths + 0x20ull * (uint64_t)i) >> 40) + 1, h = (key * 2654435761u) & (ocap - 1);
+            while (okey[h] && okey[h] != key) h = (h + 1) & (ocap - 1);
+            if (okey[h] && ocnt[h] < 0xffff) ocnt[h]++;
+        }
+    }
+    /* MT: each file-data row's ARCHIVE size, as first seen: several loose files can share one row (Kazuya's voice banks:
+     * c02 / c05 / c06 on data 0x3693), and a raise below changed what the next one read as "the archive's size" (pack
+     * Kazuya c02 Marge + c05 Kermitzuya + c06 Devil Jin: c06 took c05's raised 1687696 for the archive's 860608; the
+     * unshare then gave the shared record that size back: no fight) */
+    uint32_t dcap = 1024; while (dcap < (uint32_t)g_lf_count * 4) dcap <<= 1;
+    uint32_t *dkey = calloc(dcap, sizeof *dkey), *dval = calloc(dcap, sizeof *dval);
     for (int k = 0; k < g_lf_count; k++) {
         LooseFile *f = &g_lf[k];
         int64_t i = lf_find(arc, f->hash);
@@ -1179,18 +1721,70 @@ static void lf_resolve(uint64_t fsinfo, uint64_t arc) {
         f->data_index = lf_r32(to_data + 12ull * itd + 4);
         uint64_t d = datas + 16ull * f->data_index;
         f->arc_size = lf_r32(d + 8);
-        if (f->size > f->arc_size) lf_w32(d + 8, f->size);
+        if (dkey && dval) {
+            uint32_t key = f->data_index + 1, h = (key * 2654435761u) & (dcap - 1);
+            while (dkey[h] && dkey[h] != key) h = (h + 1) & (dcap - 1);
+            if (dkey[h]) f->arc_size = dval[h]; else { dkey[h] = key; dval[h] = f->arc_size; }
+        }
+        if (f->size > lf_r32(d + 8)) lf_w32(d + 8, f->size);
+        f->nr = 0;
+        if ((lf_r32(infos + 16ull * f->info_index + 12) >> 15) & 3) {       /* localized: its languages' rows, raised too */
+            for (int r = 1; r <= LF_NREGION; r++) {
+                uint32_t rdi = lf_r32(to_data + 12ull * (itd + (uint32_t)r) + 4);
+                f->rdi[f->nr++] = rdi;
+                if (f->size > lf_r32(datas + 16ull * rdi + 8)) lf_w32(datas + 16ull * rdi + 8, f->size);
+            }
+            static int n_loc; if (n_loc++ < 4 || getenv("SSBU_LOOSE_VERBOSE"))
+                lf_logf("[loose] %s: a localized file: the %d rows of its languages raised to %u bytes too (language rows' sizes were %u %u %u ...)", f->arc_path, f->nr, f->size,
+                        lf_r32(datas + 16ull * lf_r32(to_data + 12ull * (itd + 1) + 4) + 8), lf_r32(datas + 16ull * lf_r32(to_data + 12ull * (itd + 2) + 4) + 8), lf_r32(datas + 16ull * lf_r32(to_data + 12ull * (itd + 3) + 4) + 8));
+        }
+        {   /* MT: a path whose indice row leads to another path's file info shares that file's data (another slot's): replacing it
+             * in place would change both slots, and two mods on the two slots would write one buffer (run mtb pairs b001: Banjo
+             * c00 + c01, crash in the loader). Such a file is UNSHARED in the growth (SSBU_LOOSE_UNSHARE=0: off). */
+            static int un = -1; if (un < 0) { const char *ue = getenv("SSBU_LOOSE_UNSHARE"); un = !(ue && ue[0] == '0'); }
+            uint32_t src = lf_r32(infos + 16ull * f->info_index) & 0xffffffu, fl = lf_r32(infos + 16ull * f->info_index + 12);
+            /* MT: and the OTHER way round: the path owns a row of the shared pool (after the directories' rows) that other
+             * slots' paths and groups lead to. Corrin's spearhand mesh: all 8 slots name pool row 0x93b07, which names c04's
+             * path; pack Kamui c04 Orochimaru replaced it in place for every slot, c03 Korra loaded it beside its own vanilla
+             * numdlb: crash in f_71035ff340. Unshared too: the pool row keeps the vanilla bytes (ARCropolis'
+             * reshare_dependent_files), this path gets a record of its own. SSBU_LOOSE_UNSHARE_OWNER=0: off, 2: pool rows only
+             * (the default), 1: directory rows too, 3: directory rows only (test: a directory row unshared so left the
+             * other slots' loads waiting, pack Pokemon Trainer c00 TF2 Engineer: no fight) */
+            static int uo = -1; if (uo < 0) { const char *ue = getenv("SSBU_LOOSE_UNSHARE_OWNER"); uo = ue && *ue ? atoi(ue) : 2; }
+            int owner = 0;
+            if (uo && src == (uint32_t)i) {
+                owner = f->info_index >= lf_r32(header + 0x18) && uo != 3;
+                /* or a directory's own row that other slots' paths lead to (Dedede's Waddle Dee mesh: the 8 slots' paths share
+                 * indice 0x11efb -> c00's row 0x67e01; pack Dedede c00 Totoro replaced it for every slot, c04 Tinkaton crashed
+                 * in the loader f_71037a2aa0) */
+                if (!owner && okey && ocnt) {
+                    uint32_t key = f->indice_index + 1, h = (key * 2654435761u) & (ocap - 1);
+                    while (okey[h] && okey[h] != key) h = (h + 1) & (ocap - 1);
+                    int dirown = okey[h] == key && ocnt[h] > 1;
+                    /* unsharing such an owner (modes 1 / 3) left the other slots' loads waiting; by default the other slots
+                     * are RESHARED instead (stage 2): SSBU_LOOSE_RESHARE=0: off */
+                    static int rsh = -1; if (rsh < 0) { const char *re = getenv("SSBU_LOOSE_RESHARE"); rsh = !(re && re[0] == '0'); }
+                    if (uo == 1 || uo == 3) owner = dirown;
+                    else if (dirown && rsh && !(fl & 0x18000)) { f->reshare = 1; g_lf_reshare++; }
+                }
+            }
+            if (un && (src != (uint32_t)i || owner) && !(fl & 0x18000)) { f->shared = 1; g_lf_ushare++; }
+        }
         found++;
         lf_logf("[loose] %s: file path index 0x%x, file info 0x%x, data 0x%x: archive size %u (compressed %u), loose size %u%s",
                 f->arc_path, (unsigned)i, f->info_index, f->data_index, f->arc_size, lf_r32(d + 4), f->size, f->size > f->arc_size ? " (size in the table raised)" : "");
     }
+    free(okey); free(ocnt); free(dkey); free(dval);
     for (int k = 0; k < g_lf_count; k++) {
         if (g_lf[k].path_index >= 0) continue;
         if (g_lf[k].owner >= 0) pending++;
-        else lf_logf("[loose] %s (%u bytes): not in the archive, and its folder has no manifest: NOT served", g_lf[k].arc_path, g_lf[k].size);
+        else if (g_lf[k].xdir) { pending++; g_lf_xcount++; }
+        else lf_logf("[loose] %s (%u bytes): not in the archive, its folder has no manifest and no directory to add it to: NOT served", g_lf[k].arc_path, g_lf[k].size);
     }
     lf_logf("[loose] %d loose files, %d found among the archive's %u file paths, %d under new paths of fighter folders", g_lf_count, found, n, pending);
-    if (pending) {
+    if (g_lf_ushare) lf_logf("[loose] %d replaced files share their data with another slot's file: they are unshared", g_lf_ushare);
+    if (g_lf_reshare) lf_logf("[loose] %d replaced files own data other slots' paths share: those paths get a vanilla copy (reshared)", g_lf_reshare);
+    if (pending || g_lf_ushare || g_lf_reshare) {
         const char *e = getenv("SSBU_LOOSE_STAGE2");
         /* N7 hand-back: stage 2 is OPT-IN (SSBU_LOOSE_STAGE2=1, or "files" / "search" for diagnosis) until a match is
          * reached with own groups (plan\phases\N7_own_files2.md 2.5); without it a fighter folder behaves as in N5 */
@@ -1291,23 +1885,62 @@ static int loose_files_has(uint64_t hash) {
     if (!g_lf_scanned) return 0;
     if (!g_lf_resolved) lf_ready(0);
     if (!g_lf_grown || !g_lf_search_on) return 0;
-    for (int g = 0; g < g_lf_group_count; g++) if (g_lf_group[g].hash == hash) return 3;
+    for (int g = 0; g < g_lf_group_count; g++) if (!g_lf_group[g].inplace && g_lf_group[g].hash == hash) return 3;
     for (int j = 0; j < g_lf_new_count; j++) if (g_lf_new[j].kind != 3 && g_lf_new[j].hash == hash) return 1;
     for (int i = 0; i < g_lf_folder_count; i++) if (!g_lf_folder[i].exists && g_lf_folder[i].hash == hash) return 2;
     return 0;
 }
+static long g_lf_pinned; static long long g_lf_pinned_bytes;          /* virtual records kept loaded (lf_serve) */
 static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw);
+static __thread uint64_t g_lf_copy_dest, g_lf_copy_size;     /* the destination of the one-call raw copy (lf_rawcopy): a single file's buffer, before the game records it */
+/* TEST (debug_mode.c, SSBU_DEBUG_SAMPLE with SSBU_LOOSE_DUMPROWS=<first file info hex>,<count>): the rows of those file infos
+ * as the game has them now: info, its indice, info-to-data, data row, and the indice's loaded-data row (0x18 bytes) */
+void loose_dump_rows(uint32_t first, uint32_t n) {
+    uint64_t fsinfo = g_lf_fsinfo, pi = fsinfo ? lf_r64(fsinfo + 0x78) : 0, arc = pi ? lf_r64(pi) : 0;
+    if (!arc) { lf_logf("[loose] rows: no tables"); return; }
+    uint64_t paths = lf_r64(arc + 0x60), ind = lf_r64(arc + 0x68), infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0);
+    uint64_t lfp = lf_r64(fsinfo + 8), ld = lf_r64(fsinfo + 0x10);
+    for (uint32_t r = first; r < first + n; r++) {
+        uint64_t ir = infos + 16ull * r;
+        uint32_t pth = lf_r32(ir), xi = lf_r32(ir + 4), itd = lf_r32(ir + 8), fl = lf_r32(ir + 12);
+        uint32_t dfo = lf_r32(to_data + 12ull * itd), di = lf_r32(to_data + 12ull * itd + 4), dw = lf_r32(to_data + 12ull * itd + 8);
+        uint64_t dr = datas + 16ull * di, lr = ld + 0x18ull * xi;
+        uint32_t pi2 = pth & 0xffffffu;
+        lf_logf("[loose] rows: info 0x%x: path 0x%x (hash %llx) indice 0x%x (-> info 0x%x) itd 0x%x flags %08x | itd %x %x %x | data 0x%x: %08x %08x %08x %08x | loaded %016llx %016llx %016llx | path row lfp %016llx",
+                r, pth, (unsigned long long)(lf_r64(paths + 0x20ull * pi2) & LF_MASK40), xi, lf_r32(ind + 8ull * xi + 4) & 0xffffffu, itd, fl, dfo, di, dw, di,
+                lf_r32(dr), lf_r32(dr + 4), lf_r32(dr + 8), lf_r32(dr + 12),
+                (unsigned long long)lf_r64(lr), (unsigned long long)lf_r64(lr + 8), (unsigned long long)lf_r64(lr + 16), (unsigned long long)lf_r64(lfp + 8ull * pi2));
+    }
+}
+/* TEST (SSBU_LOOSE_BATCHLOG=1): each batch the load thread works on (its first file info and count), once, when its
+ * first file is decompressed or copied (mod test series: Joker's results never came after a fight with a modded Mona) */
+static void lf_batch_note(uint64_t service, const char *how) {
+    static int on = -1; static uint32_t last_s = ~0u, last_n;
+    if (on < 0) on = getenv("SSBU_LOOSE_BATCHLOG") && atoi(getenv("SSBU_LOOSE_BATCHLOG"));
+    if (!on) return;
+    uint32_t st = lf_r32(service + 0x230), n = lf_r32(service + 0x22c);
+    if (st == last_s && n == last_n) return;
+    last_s = st; last_n = n;
+    lf_logf("[loose] batch: file infos 0x%x..+%u (%s)", st, n, how);
+}
+/* MT: the first file info of the batch the inflate thread 0x71035444c0 is working on: ITS copy (its frame's [sp+4],
+ * stored at the batch's start 0x7103544b1c and read back from there), not the service's +0x230: the load loop sets that
+ * up for the NEXT batch as soon as the read buffers allow, so for files asked for one after another it named the next
+ * request's file while this one was decompressed or copied (mod test series: Mona's numdlb, 1496 bytes, came with
+ * numshexb's file info). sp = the thread's stack pointer at its call (the callee's entry). */
+static uint32_t lf_batch_start(uint64_t sp) { return lf_r32(sp + 4); }
 // 0x71039a4040: one step of the decompression of the file the inflate thread is working on
 static void lf_inflate(Ctx *c, void *user) {
     (void)user;
-    uint64_t lr = c->x[30], service = c->x[19], index = c->x[27];
+    uint64_t lr = c->x[30], service = c->x[19], index = c->x[27], sp = c->x[31];
     int from_thread = lr >= GA(0x71035444c0ull) && lr < GA(0x71035456d8ull);
     if (from_thread && !g_lf_resolved) lf_ready(service);
     g_lf_orig_inflate(c);
     if (!from_thread || c->x[0] != 0) return;
     uint64_t fsinfo, arc;
     if (!lf_tables(service, &fsinfo, &arc)) return;
-    uint32_t info_index = lf_r32(service + 0x230) + (uint32_t)index;
+    uint32_t info_index = lf_batch_start(sp) + (uint32_t)index;
+    lf_batch_note(service, "decompressed");
     lf_trace_batch("decompress finished", service, arc, info_index, c->x[21]);
     if (g_lf_grown && g_lf_first_new_info && info_index >= g_lf_first_new_info && info_index < g_lf_first_new_info + (uint32_t)g_lf_plan_count) {
         /* a file of one of OUR file infos was decompressed: which kind of row */
@@ -1331,20 +1964,104 @@ static void lf_inflate(Ctx *c, void *user) {
 // raw = 0: called when the decompress of the file has finished; raw = 1 (N8): called after each raw copy of a file
 // the archive stores UNCOMPRESSED (such a file never passes the decompress call; the last copy's rewrite stays)
 static long g_lf_served_raw, g_lf_footer;
+static int lf_is_xinfo(const LooseFile *f, uint32_t info_index) {
+    for (int x = 0; x < f->nx; x++) if (f->info_x[x] == info_index) return 1;
+    return 0;
+}
+/* MT: file info -> the first loose file served for it. Every decompress and raw copy of the game asks; with a merged
+ * pack of ~33000 files a walk of the whole list per file was most of the loader's time in a match load. Built
+ * once the tables are final (after the growth), rebuilt if they change. */
+static uint32_t *g_lf_map_key; static int32_t *g_lf_map_val; static uint32_t g_lf_map_mask; static int g_lf_map_ver = -1;
+static void lf_map_put(uint32_t key, int k) {
+    for (uint32_t h = (key * 2654435761u) & g_lf_map_mask;; h = (h + 1) & g_lf_map_mask) {
+        if (g_lf_map_key[h] == key + 1) return;              /* the first file keeps it, as the walk did */
+        if (!g_lf_map_key[h]) { g_lf_map_key[h] = key + 1; g_lf_map_val[h] = k; return; }
+    }
+}
+static int lf_map_find(uint32_t key) {
+    int ver = g_lf_resolved + 2 * g_lf_grown;
+    if (ver != g_lf_map_ver) {
+        EnterCriticalSection(&g_lf_lock);
+        if (ver != g_lf_map_ver) {
+            uint32_t cap = 1024;
+            while (cap < (uint32_t)g_lf_count * (3 + LF_XINFO) * 2) cap <<= 1;
+            free(g_lf_map_key); free(g_lf_map_val);
+            g_lf_map_key = calloc(cap, sizeof *g_lf_map_key); g_lf_map_val = calloc(cap, sizeof *g_lf_map_val); g_lf_map_mask = cap - 1;
+            for (int k = 0; k < g_lf_count; k++) {
+                const LooseFile *f = &g_lf[k];
+                if (f->path_index < 0) continue;
+                lf_map_put(f->info_index, k);
+                if (f->info_alt) lf_map_put(f->info_alt, k);
+                if (f->info_single) lf_map_put(f->info_single, k);
+                for (int x = 0; x < f->nx; x++) lf_map_put(f->info_x[x], k);
+            }
+            g_lf_map_ver = ver;
+        }
+        LeaveCriticalSection(&g_lf_lock);
+    }
+    for (uint32_t h = (key * 2654435761u) & g_lf_map_mask;; h = (h + 1) & g_lf_map_mask) {
+        if (!g_lf_map_key[h]) return -1;
+        if (g_lf_map_key[h] == key + 1) return g_lf_map_val[h];
+    }
+}
 static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
-    for (int k = 0; k < g_lf_count; k++) {
+    int k = lf_map_find(info_index);
+    if (k >= 0) do {
         LooseFile *f = &g_lf[k];
-        if (f->path_index < 0 || f->info_index != info_index) continue;
         if (raw == 1 && ++g_lf_served_raw <= 3)
             lf_logf("[loose] %s: stored UNCOMPRESSED in the archive: served at the load thread's raw copy (file info 0x%x)", f->arc_path, info_index);
         uint64_t datas = lf_r64(fsinfo + 0x10);
         uint64_t buf = lf_r64(datas + 0x18ull * f->indice_index);
-        if (!lf_readable(buf, f->size)) { lf_logf("[loose] %s: the game's buffer %llx is not there or too small: NOT served", f->arc_path, (unsigned long long)buf); return; }
+        /* MT (standalone): a file asked for on its own (lf_dirload) gets its buffer recorded in its loaded-data row only
+         * after the copy: the copy's destination is that buffer (Joker's results: "buffer 0" for Mona's files) */
+        if (!buf && raw == 2 && f->standalone) buf = g_lf_copy_dest;
+        if (raw == 2 && g_lf_copy_size && g_lf_copy_size != f->size) {      /* never more bytes than the copy's (its buffer) */
+            lf_logf("[loose] %s: the copy at the raw-copy site is %llu bytes, the file %u: NOT served (file info 0x%x)", f->arc_path, (unsigned long long)g_lf_copy_size, f->size, info_index);
+            return;
+        }
+        {   /* MT: the buffer is the size of THIS file info's data row (what the game allocated from), which need not be the
+             * one lf_resolve raised (another directory's entry, a shared record): a larger file written whole ran over the
+             * heap (extended trials: crashes at random sites, garbage pointers). Such a file is not served. */
+            uint64_t pi = lf_r64(fsinfo + 0x78), arc = pi ? lf_r64(pi) : 0;
+            if (arc && raw != 2) {
+                uint64_t infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), dt = lf_r64(arc + 0xa0);
+                uint32_t itd = lf_itd_live(infos, info_index), di = lf_r32(to_data + 12ull * itd + 4), room = lf_r32(dt + 16ull * di + 8);
+                if (room && f->size > room) {
+                    static long n_big; if (n_big++ < 64 || getenv("SSBU_LOOSE_VERBOSE"))
+                        lf_logf("[loose] %s: %u bytes, but the buffer of file info 0x%x is %u (data row 0x%x; raw %d): NOT served (would run over the heap; %ld so far)",
+                                f->arc_path, f->size, info_index, room, di, raw, n_big);
+                    return;
+                }
+            }
+        }
+        if (!lf_readable(buf, f->size)) {
+            MEMORY_BASIC_INFORMATION mi; memset(&mi, 0, sizeof mi); if (buf >= 0x10000) VirtualQuery((void *)(uintptr_t)buf, &mi, sizeof mi);
+            lf_logf("[loose] %s: the game's buffer %llx is not there or too small: NOT served (%u bytes; region %p + %zx state %lx protect %lx; copy destination %llx size %llx)", f->arc_path, (unsigned long long)buf,
+                    f->size, mi.BaseAddress, (size_t)mi.RegionSize, (unsigned long)mi.State, (unsigned long)mi.Protect, (unsigned long long)g_lf_copy_dest, (unsigned long long)g_lf_copy_size);
+            return;
+        }
         FILE *fp = fopen(f->disk_path, "rb");
         if (!fp) { lf_logf("[loose] %s: cannot open %s", f->arc_path, f->disk_path); return; }
         size_t got = fread((void *)(uintptr_t)buf, 1, f->size, fp);
         fclose(fp);
         f->served++;
+        if (f->sa_queued && InterlockedExchange(&f->sa_queued, 0) && (g_lf_sa_served++ < 8 || getenv("SSBU_LOOSE_VERBOSE")))
+            lf_logf("[loose] %s: standalone virtual record served on its own request (lf_dirload)", f->arc_path);
+        {   /* MT: an unshared file of a group that OTHER directories list too (a fighter's victory-screen models: Joker's Mona,
+             * the Pikmin of a win pose, Doc Louis, the Pokemon) is loaded first through its group's batch; released after the
+             * fight and asked for again on its own (the results), the virtual record never loaded: its loaded-data row stayed
+             * "requested" with no buffer and the results never came (mod test series: Joker c01 / c02 / c05 / c06 with a
+             * modded Mona; vanilla and an unmodded Mona fine). Such a record keeps one reference of its own from its first
+             * load on, so it is never released. SSBU_LOOSE_PIN=1: every virtual record, 2: only these; 0 (default): off. NOT the fix:
+             * with it the results came, but the NEXT fight's batch of the same group crashed in the load thread's one-call copy
+             * (0x7103545198, 13.0.4) on a kept record (series pilot s51). */
+            static int pin = -1; if (pin < 0) { const char *pe = getenv("SSBU_LOOSE_PIN"); pin = pe && *pe ? atoi(pe) : 0; }
+            if (raw == 2 && f->served == 1 && (pin == 1 || (pin == 2 && f->nx > 0 && strncmp(f->arc_path, "sound/", 6)))) {
+                uint64_t rc = datas + 0x18ull * f->indice_index + 8; lf_w32(rc, lf_r32(rc) + 1); g_lf_pinned++; g_lf_pinned_bytes += f->size;
+                if (g_lf_pinned <= 3 || getenv("SSBU_LOOSE_VERBOSE"))
+                    lf_logf("[loose] %s: virtual record kept loaded (other directories list it too; %ld kept so far, %lld KB)", f->arc_path, g_lf_pinned, g_lf_pinned_bytes >> 10);
+            }
+        }
         {   /* N10: (1) a texture file ends with a fixed footer that its reader takes from the END of the buffer: when the
              * folder's texture is SMALLER than the buffer (the size in the file-data row: the donor file's), the footer
              * is copied to the buffer's end too (what reference\ARCropolis does in handle_file_replace: 0xb0 bytes).
@@ -1352,7 +2069,7 @@ static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
             uint64_t tb, ta;
             const char *e4 = strrchr(f->arc_path, '.');
             if (lf_tables(0, &tb, &ta)) {
-                uint32_t cap = lf_r32(lf_r64(ta + 0xa0) + 16ull * f->data_index + 8);
+                uint32_t cap = lf_r32(lf_r64(ta + 0xa0) + 16ull * lf_data_live(ta, info_index) + 8);
                 if (e4 && !strcmp(e4, ".nutexb") && got >= 0xb0 && cap > got && cap < 0x10000000u && lf_readable(buf, cap)) {
                     memcpy((void *)(uintptr_t)(buf + cap - 0xb0), (void *)(uintptr_t)(buf + got - 0xb0), 0xb0);
                     if (++g_lf_footer <= 4 || getenv("SSBU_LOOSE_VERBOSE"))
@@ -1378,7 +2095,7 @@ static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
                     "fighters); %ld more files of its group filled with the donor's bytes (the folder does not bring them)", g_lf_owner[f->owner].name, g_lf_owner[f->owner].served,
                     g_lf_owner[f->owner].new_files, g_lf_owner[f->owner].bytes, g_lf_served_raw, g_lf_owner[f->owner].donor_bytes_files);
         return;
-    }
+    } while (0);
 }
 // N8: the host's copy function 0x71039bfb30 as the load thread 0x71035444c0 calls it for a file stored uncompressed
 // (two call sites, return addresses 0x7103544d88 and 0x7103544e18: destination = the file's buffer, [x26]); x19 = the
@@ -1386,16 +2103,78 @@ static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
 static HookOrig g_lf_orig_copy;
 static void lf_rawcopy(Ctx *c, void *user) {
     (void)user;
-    uint64_t lr = c->x[30], service = c->x[19], index = c->x[27];
+    uint64_t lr = c->x[30], service = c->x[19], index = c->x[27], sp = c->x[31];
     /* N10: a VIRTUAL record (SSBU_LOOSE_TEMPLATE=3) arrives at the one-call site with x2 = the folder file's size and
      * x1 = the running pointer into the read window, where no bytes of this file are: the copy itself is NOT run (it
      * would read the file's size from the window, possibly past its end); the folder's file is written instead. */
     if (lr == GA(0x7103545198ull) && g_lf_virtual && g_lf_grown && g_lf_resolved) {
         uint64_t fsinfo, arc;
-        uint32_t ii = lf_tables(service, &fsinfo, &arc) ? lf_r32(service + 0x230) + (uint32_t)index : 0;
+        uint32_t ii = lf_tables(service, &fsinfo, &arc) ? lf_batch_start(sp) + (uint32_t)index : 0;
         if (ii >= g_lf_first_new_info && ii < g_lf_first_new_info + (uint32_t)g_lf_plan_count) {
             int j = g_lf_plan[ii - g_lf_first_new_info].new_index;
-            if (j >= 0 && g_lf_new[j].kind == 5) { lf_serve(fsinfo, ii, 2); return; }
+            if ((j >= 0 && g_lf_new[j].kind == 5) || j == -2) { g_lf_copy_dest = c->x[0]; g_lf_copy_size = c->x[2]; lf_serve(fsinfo, ii, 2); g_lf_copy_dest = 0; return; }
+        } else if (ii) {
+            int k = lf_map_find(ii);
+            if (k >= 0 && (lf_is_xinfo(&g_lf[k], ii) || g_lf[k].info_single == ii)) { g_lf_copy_dest = c->x[0]; g_lf_copy_size = c->x[2]; lf_serve(fsinfo, ii, 2); g_lf_copy_dest = 0; return; }
+        }
+    }
+    /* MT: a file the archive stores uncompressed, replaced in place by a LARGER loose file: its size in the table was
+     * raised (lf_resolve), so the copy takes that many bytes from the read window, which holds the archive's (compressed
+     * size) only; past the end of the window's mapping that faulted (extended trials series_y s01: 361264 bytes from
+     * 0x7f5ef5cbfff0, the next page unmapped). The copy takes the record's bytes only; the file is written whole after. */
+    if (lr == GA(0x7103545198ull) && g_lf_grown && g_lf_resolved) {
+        uint64_t fsinfo, arc;
+        if (lf_tables(service, &fsinfo, &arc)) {
+            uint32_t ii = lf_batch_start(sp) + (uint32_t)index;
+            int k = lf_map_find(ii);
+            if (k >= 0) {
+                uint64_t infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0);
+                uint32_t itd = lf_itd_live(infos, ii), di = lf_r32(to_data + 12ull * itd + 4), cs = lf_r32(datas + 16ull * di + 4);
+                if (cs && c->x[2] > cs) {
+                    static long n_clamp; if (n_clamp++ < 64 || getenv("SSBU_LOOSE_VERBOSE"))
+                        lf_logf("[loose] %s: uncompressed in the archive, raised to %llu bytes: the raw copy takes the record's %u (file info 0x%x)", g_lf[k].arc_path, (unsigned long long)c->x[2], cs, ii);
+                    c->x[2] = cs;
+                }
+            }
+        }
+    }
+    /* MT: the one-call copy reading past the read window (service +0x218 buffer, +0x220 its size): extended trials
+     * series_v s01_00, 184512 bytes from exactly the window's end, the next page unmapped. Logged with what the
+     * tables say of the file, and the copy cut to the window. */
+    /* MT: a virtual record {offset 0, csize 0, size} has no bytes in the archive, so the game's one-call copy of `size`
+     * bytes reads whatever follows the window (extended trials diag_hr2 s01_00: 2.7 MB from the window's base into the
+     * guard page after its mapping, unseen by the window guard below). lf_serve fills the buffer after this call: the
+     * copy is skipped. */
+    if (lr == GA(0x7103545198ull) && g_lf_resolved && c->x[2]) {
+        uint64_t fsinfo, arc; uint32_t ii = lf_batch_start(sp) + (uint32_t)index;
+        if (lf_tables(service, &fsinfo, &arc)) {
+            uint64_t infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0);
+            uint32_t itd = lf_itd_live(infos, ii), di = lf_r32(to_data + 12ull * itd + 4);
+            int k = lf_map_find(ii);
+            if (k >= 0 && !lf_r32(datas + 16ull * di) && !lf_r32(datas + 16ull * di + 4)) {
+                static long n_virt; if (n_virt++ < 8 || getenv("SSBU_LOOSE_VERBOSE"))
+                    lf_logf("[loose] %s: virtual record in its batch: the game's copy of %llu bytes skipped, the file is served into its buffer (file info 0x%x; %ld so far)",
+                            g_lf[k].arc_path, (unsigned long long)c->x[2], ii, n_virt);
+                c->x[2] = 0;
+            }
+        }
+    }
+    if (lr == GA(0x7103545198ull) && g_lf_resolved) {
+        uint64_t win = lf_r64(service + 0x218), cap = lf_r64(service + 0x220), src = c->x[1], len = c->x[2];
+        if (win && cap && src >= win && src <= win + cap && src + len > win + cap) {
+            uint64_t fsinfo, arc; uint32_t ii = lf_batch_start(sp) + (uint32_t)index, cs = 0, ds = 0, fl = 0, off = 0, itd = 0, di = 0;
+            int k = -1;
+            if (lf_tables(service, &fsinfo, &arc)) {
+                uint64_t infos = lf_r64(arc + 0x90), to_data = lf_r64(arc + 0x98), datas = lf_r64(arc + 0xa0);
+                itd = lf_itd_live(infos, ii); di = lf_r32(to_data + 12ull * itd + 4);
+                off = lf_r32(datas + 16ull * di); cs = lf_r32(datas + 16ull * di + 4); ds = lf_r32(datas + 16ull * di + 8); fl = lf_r32(datas + 16ull * di + 12);
+                k = lf_map_find(ii);
+            }
+            static long n_over; if (n_over++ < 64 || getenv("SSBU_LOOSE_VERBOSE"))
+                lf_logf("[loose] RAW COPY PAST THE WINDOW: file info 0x%x (batch start 0x%x + %llu) %s: %llu bytes at window +0x%llx of 0x%llx; data row 0x%x: offset 0x%x csize %u size %u flags 0x%x (file to data 0x%x)%s",
+                        ii, lf_batch_start(sp), (unsigned long long)index, k >= 0 ? g_lf[k].arc_path : "(not a loose file)", (unsigned long long)len, (unsigned long long)(src - win),
+                        (unsigned long long)cap, di, off, cs, ds, fl, itd, k >= 0 && g_lf[k].standalone ? " STANDALONE" : "");
+            c->x[2] = win + cap - src;
         }
     }
     g_lf_orig_copy(c);
@@ -1405,8 +2184,191 @@ static void lf_rawcopy(Ctx *c, void *user) {
     if (lr != GA(0x7103544d88ull) && lr != GA(0x7103544e18ull) && lr != GA(0x7103545198ull)) return;
     uint64_t fsinfo, arc;
     if (!g_lf_resolved || !lf_tables(service, &fsinfo, &arc)) return;
-    lf_trace_batch("raw copy", service, arc, lf_r32(service + 0x230) + (uint32_t)index, lr);
-    lf_serve(fsinfo, lf_r32(service + 0x230) + (uint32_t)index, 1);
+    lf_batch_note(service, "raw copy");
+    lf_trace_batch("raw copy", service, arc, lf_batch_start(sp) + (uint32_t)index, lr);
+    lf_serve(fsinfo, lf_batch_start(sp) + (uint32_t)index, 1);
+}
+
+/* MT (SSBU_LOOSE_STANDALONE): ARCropolis' res_loop_common (threads.rs). A standalone virtual record (unshare, above)
+ * belongs to no directory, so a directory that lists it too never loads it: Joker's results load Mona's directory
+ * fighter/jack/model/mona/c01 (dir info 6627), whose data is the shared file group, and the modded Mona files stayed
+ * "requested" with no buffer. The load thread's loop 0x7103543640 hands every directory request to 0x7103545c80
+ * (x0 = the resource service, w2 = the directory info, w3 = how, w4 = the group it leads to, 0xffffff = none): after
+ * it, each standalone file such a directory lists (its other entries, info_x) whose loaded-data row is in use, still
+ * without a buffer, gets a request of its own (LoadInfo {type 1 = file, path index, 0xffffff, 0}) at the head of the
+ * service's first list (+0x58: {size, next, prev}; nodes {next, prev, LoadInfo}), under the service's mutex (+0), and
+ * the loop's "new requests" flag +0xe7. Its node is not one of the loop's pool's: dropped after use, never freed. */
+static HookOrig g_lf_orig_dirload; static long g_lf_sa_requests;
+static void lf_dirload(Ctx *c, void *user) {
+    (void)user;
+    uint64_t service = c->x[0]; uint32_t dir = (uint32_t)c->x[2], dir2 = (uint32_t)c->x[4];
+    g_lf_orig_dirload(c);
+    uint64_t fsinfo, arc;
+    if (!g_lf_grown || !g_lf_resolved || !lf_tables(service, &fsinfo, &arc)) return;
+    uint64_t hdr = lf_r64(arc + 0x40), dirs = lf_r64(arc + 0x78), paths = lf_r64(arc + 0x60), ld = lf_r64(fsinfo + 0x10);
+    uint32_t n_dir = lf_r32(hdr + 0xc), d[2] = {dir, dir2};
+    uint64_t ret[2] = {c->x[0], c->x[1]};
+    static int *sa, n_sa = -1;
+    if (n_sa < 0) {
+        EnterCriticalSection(&g_lf_lock);
+        if (n_sa < 0) {
+            int n = 0; sa = malloc(sizeof(int) * (size_t)(g_lf_sa_count + 1));
+            for (int k = 0; sa && k < g_lf_count; k++) if (g_lf[k].standalone && n < g_lf_sa_count) sa[n++] = k;
+            lf_logf("[loose] %d standalone virtual record(s) (SSBU_LOOSE_STANDALONE)", n);
+            n_sa = n;
+        }
+        LeaveCriticalSection(&g_lf_lock);
+    }
+    int queued = 0;
+    for (int w = 0; w < 2; w++) {
+        if (d[w] >= n_dir || (w && d[1] == d[0])) continue;
+        uint32_t fs = lf_r32(dirs + 0x34ull * d[w] + 0x20), fc = lf_r32(dirs + 0x34ull * d[w] + 0x24);
+        for (int q = 0; q < n_sa; q++) {
+            LooseFile *f = &g_lf[sa[q]];
+            if (f->sa_queued) continue;
+            int in = 0;
+            for (int x = 0; x < f->nx && !in; x++) in = f->info_x[x] >= fs && f->info_x[x] < fs + fc;
+            if (!in) continue;
+            uint64_t row = ld + 0x18ull * f->indice_index;
+            if (!lf_r8(row + 0xc) || (int32_t)lf_r32(row + 8) < 1 || lf_r64(row)) continue;      /* not asked for, or loaded */
+            /* its own group asked for (reference count +4; its state +9 stays 1 = unloaded once released) in the loaded
+             * directories (filesystem info +0x40, 0x48 a row): that batch loads it. A request of its own as well loaded it twice, into two buffers
+             * for one row (extended trials series_y / z: fight 1 with Joker c01, crashes later at a different place each
+             * run; se_jack_c01.nus3audio and the stage's models were asked for while their groups loaded) */
+            if (f->sa_dir != LF_NONE && f->sa_dir < lf_r32(fsinfo + 0x48)) {
+                uint64_t lrow = lf_r64(fsinfo + 0x40) + 0x48ull * f->sa_dir;
+                if ((int32_t)lf_r32(lrow + 4) > 0) continue;
+            }
+            uint64_t node = (uint64_t)(uintptr_t)calloc(1, 0x20), list = service + 0x58;
+            if (!node) continue;
+            if (!queued++) {
+                ImportFn lk = import_lookup("_ZN2nn2os9LockMutexEPNS0_9MutexTypeE");
+                c->x[0] = lf_r64(service); if (lk) lk(c);
+            }
+            lf_w32(node + 0x10, 1); lf_w32(node + 0x14, (uint32_t)f->path_index); lf_w32(node + 0x18, LF_NONE); lf_w32(node + 0x1c, 0);
+            uint64_t next = lf_r64(list + 8);
+            lf_w64(node, next); lf_w64(node + 8, list + 8);
+            lf_w64(next + 8, node); lf_w64(list + 8, node); lf_w64(list, lf_r64(list) + 1);
+            InterlockedExchange(&f->sa_queued, 1);
+            if (g_lf_sa_requests++ < 8 || getenv("SSBU_LOOSE_VERBOSE"))
+                lf_logf("[loose] %s: standalone virtual record: asked for on its own with directory info %u (path 0x%x, loaded-data row 0x%x)", f->arc_path, d[w], (uint32_t)f->path_index, f->indice_index);
+        }
+    }
+    (void)paths;
+    if (queued) {
+        lf_w8(service + 0xe7, 1);
+        ImportFn ul = import_lookup("_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE");
+        c->x[0] = lf_r64(service); if (ul) ul(c);
+    }
+    c->x[0] = ret[0]; c->x[1] = ret[1];
+}
+
+/* ---------------------------------------------------------------- MT: one-slot effects
+ * A fighter's effects come from the first .eff file among the children of its search folder effect/fighter/<f> (the
+ * effect load 0x710355f8f0 walks them), and its trails from effect/fighter/<f>/trail. A mod's ef_<f>_cNN.eff is a new
+ * file of directory fighter/<f>/cNN (loaded with that costume only), linked at the head of the folder's children: every
+ * other costume then took it as ITS effect file, whose data is not loaded - a copy from a null pointer in 0x710355f8f0
+ * (pack runs: Link, Pokemon Trainer; reproduced with one ef_link_c05.eff and Link c00). On the console the plugin
+ * libone_slot_eff.nro (reference: github Claude-1308/one-slot-effects) makes that choice with inline hooks. Here, with
+ * function hooks: the fighter's lookup of its effect folder (0x71017e88d0 with w3 = 0x14; x1 = the player's record,
+ * costume at +100) notes the costume and the folder's path index for this guest context, and the effect load, for a
+ * folder a mod adds such files to, first moves the costume's own file to the head of the children (else the archive's
+ * ef_<f>.eff) and, while it runs, points the folder index entry of effect/fighter/<f>/trail at trail_cNN when the
+ * costume has one. Not done (the plugin's other half): renaming the effects inside the file per costume, so two costumes
+ * of one fighter in a match with different effect files share the first one loaded. */
+#define LF_MAX_EFX 96
+typedef struct { uint64_t folder, vanilla, trail; uint64_t eff[8], trail_n[8]; char name[32]; } LfEff;
+static LfEff g_lf_efx[LF_MAX_EFX]; static int g_lf_efx_count;
+static struct { Ctx *c; int slot; uint32_t index; } g_lf_efn[32];
+static HookOrig g_lf_orig_efl, g_lf_orig_efload;
+static CRITICAL_SECTION g_lf_eff_lock;
+static void lf_eff_table(void) {
+    for (int k = 0; k < g_lf_count; k++) {
+        char fi[64]; int trail = 0, sl = lf_eff_slot_of(g_lf[k].arc_path, fi, sizeof fi, &trail);
+        if (sl < 0 || sl > 7) continue;
+        char p[200]; snprintf(p, sizeof p, "effect/fighter/%s", fi);
+        uint64_t fh = lf_hash40(p); int at = -1;
+        for (int i = 0; i < g_lf_efx_count; i++) if (g_lf_efx[i].folder == fh) at = i;
+        if (at < 0) {
+            if (g_lf_efx_count >= LF_MAX_EFX) continue;
+            LfEff *x = &g_lf_efx[at = g_lf_efx_count++]; memset(x, 0, sizeof *x);
+            x->folder = fh; snprintf(x->name, sizeof x->name, "%s", fi);
+            snprintf(p, sizeof p, "effect/fighter/%s/ef_%s.eff", fi, fi); x->vanilla = lf_hash40(p);
+            snprintf(p, sizeof p, "effect/fighter/%s/trail", fi); x->trail = lf_hash40(p);
+        }
+        if (trail) { snprintf(p, sizeof p, "effect/fighter/%s/trail_c%02d", fi, sl); g_lf_efx[at].trail_n[sl] = lf_hash40(p); }
+        else g_lf_efx[at].eff[sl] = lf_hash40(g_lf[k].arc_path);
+    }
+}
+/* the position in a sorted hash40 | index << 40 array of the entry for hash h, or -1 */
+static int64_t lf_bsearch_pos(uint64_t base, uint32_t n, uint64_t h) {
+    int64_t lo = 0, hi = (int64_t)n - 1;
+    while (lo <= hi) { int64_t mid = (lo + hi) / 2; uint64_t e = lf_r64(base + 8ull * (uint64_t)mid) & LF_MASK40; if (e == h) return mid; if (e < h) lo = mid + 1; else hi = mid - 1; }
+    return -1;
+}
+/* make the child `want` of search folder `folder` its first child: 1 = it is (now) the first, 0 = no such child */
+static int lf_eff_front(uint64_t search, uint64_t folder, uint64_t want) {
+    uint64_t body = lf_r64(search + 8), fidx = lf_r64(search + 0x10), flist = lf_r64(search + 0x18), pli = lf_r64(search + 0x28), plist = lf_r64(search + 0x30);
+    int64_t at = lf_bsearch(fidx, lf_r32(body), folder);
+    if (at < 0) return 0;
+    uint64_t fe = flist + 0x20ull * (uint64_t)at, M = (uint64_t)LF_NONE << 40;
+    uint32_t first = lf_r32(fe + 24) & LF_NONE, prev = LF_NONE, i = first;
+    for (int guard = 0; i != LF_NONE && guard < 100000; guard++) {
+        uint64_t pe = plist + 0x20ull * lf_r32(pli + 4ull * i);
+        if ((lf_r64(pe) & LF_MASK40) == want) break;
+        prev = i; i = (uint32_t)(lf_r64(pe) >> 40) & LF_NONE;
+    }
+    if (i == LF_NONE) return 0;
+    if (prev == LF_NONE) return 1;
+    uint64_t pe = plist + 0x20ull * lf_r32(pli + 4ull * i), pp = plist + 0x20ull * lf_r32(pli + 4ull * prev);
+    /* unlink first, then put in front: a reader in between misses the entry, never loops */
+    lf_w64(pp, (lf_r64(pp) & ~M) | (lf_r64(pe) & M));
+    lf_w64(pe, (lf_r64(pe) & ~M) | ((uint64_t)first << 40));
+    lf_w32(fe + 24, (lf_r32(fe + 24) & 0xff000000u) | i);
+    return 1;
+}
+static void lf_eff_lookup(Ctx *c, void *user) {
+    (void)user;
+    uint32_t what = (uint32_t)c->x[3]; uint64_t out = c->x[0], rec = c->x[1];
+    int slot = what == 0x14 && rec ? *(const uint8_t *)(uintptr_t)(rec + 100) : -1;
+    g_lf_orig_efl(c);
+    if (what != 0x14 || !out) return;
+    EnterCriticalSection(&g_lf_eff_lock);
+    int at = -1;
+    for (int i = 0; i < 32; i++) if (g_lf_efn[i].c == c || (at < 0 && !g_lf_efn[i].c)) { at = i; if (g_lf_efn[i].c == c) break; }
+    if (at >= 0) { g_lf_efn[at].c = c; g_lf_efn[at].slot = slot; g_lf_efn[at].index = lf_r32(out); }
+    LeaveCriticalSection(&g_lf_eff_lock);
+}
+static void lf_eff_load(Ctx *c, void *user) {
+    (void)user;
+    uint64_t sp = c->x[2], fs = g_lf_fsinfo;
+    if (!sp || !fs || !g_lf_grown) { g_lf_orig_efload(c); return; }
+    uint64_t search = lf_r64(lf_r64(fs + 0x78) + 8), body = lf_r64(search + 8), plist = lf_r64(search + 0x30);
+    uint32_t si = lf_r32(sp);
+    LfEff *x = NULL;
+    if (si < lf_r32(body + 8)) {
+        uint64_t fh = lf_r64(plist + 0x20ull * si) & LF_MASK40;
+        for (int i = 0; i < g_lf_efx_count; i++) if (g_lf_efx[i].folder == fh) x = &g_lf_efx[i];
+    }
+    if (!x) { g_lf_orig_efload(c); return; }
+    EnterCriticalSection(&g_lf_eff_lock);
+    int slot = -1;
+    for (int i = 0; i < 32; i++) if (g_lf_efn[i].c == c) { if (g_lf_efn[i].index == si) slot = g_lf_efn[i].slot; g_lf_efn[i].c = NULL; }
+    int own = slot >= 0 && slot < 8 && x->eff[slot] && lf_eff_front(search, x->folder, x->eff[slot]);
+    if (!own) lf_eff_front(search, x->folder, x->vanilla);
+    /* the trail folder: the index entry of .../trail names trail_cNN's folder-list position while the load runs */
+    uint64_t fidx = lf_r64(search + 0x10), saved = 0; int64_t tp = -1;
+    if (slot >= 0 && slot < 8 && x->trail_n[slot]) {
+        int64_t np = lf_bsearch(fidx, lf_r32(body), x->trail_n[slot]);
+        tp = lf_bsearch_pos(fidx, lf_r32(body), x->trail);
+        if (np >= 0 && tp >= 0) { saved = lf_r64(fidx + 8ull * (uint64_t)tp); lf_w64(fidx + 8ull * (uint64_t)tp, (saved & LF_MASK40) | ((uint64_t)np << 40)); }
+        else tp = -1;
+    }
+    static int logged;
+    if (logged++ < 32) lf_logf("[loose] one-slot effects: %s costume %d: effect file %s%s", x->name, slot, own ? "the costume's own" : "the archive's", tp >= 0 ? ", trail folder the costume's own" : "");
+    g_lf_orig_efload(c);
+    if (tp >= 0) lf_w64(fidx + 8ull * (uint64_t)tp, saved);
+    LeaveCriticalSection(&g_lf_eff_lock);
 }
 
 // two steps for a caller that may have to wait for the hook table (the exe): scan once, then install until it works
@@ -1442,6 +2404,7 @@ static int loose_files_scan(void (*log)(const char *)) {
             }
             lf_scan(sub, "", owner);
             if (owner >= 0) lf_clone_list(sub, owner, before);
+            else lf_plain_dirs(sub, before);
             lf_logf("[loose] folder %s: %d files%s", sub, g_lf_count - before, owner >= 0 ? " (a fighter's folder: its manifest names the donor)" : "");
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -1461,9 +2424,22 @@ static int loose_files_install(int (*install)(uint64_t, HookFn, void *, HookOrig
                      * host's copy function, which every guest copy passes) */
         const char *re = getenv("SSBU_LOOSE_RAW"), *t3 = getenv("SSBU_LOOSE_TEMPLATE");
         /* N10: virtual records (SSBU_LOOSE_TEMPLATE=3) are filled at this hook: it comes with that switch */
-        if ((re && re[0] == '1') || ((!t3 || !t3[0] || t3[0] == '3') && g_lf_owner_count > 0 && !(re && re[0] == '0'))) {
+        int plain_new = 0; for (int k = 0; k < g_lf_count; k++) if (g_lf[k].owner < 0 && g_lf[k].xdir) { plain_new = 1; break; }
+        if ((re && re[0] == '1') || ((!t3 || !t3[0] || t3[0] == '3') && (g_lf_owner_count > 0 || plain_new) && !(re && re[0] == '0'))) {
             int ok2 = install(GA(0x71039bfb30ull), lf_rawcopy, NULL, &g_lf_orig_copy);
             lf_logf("[loose] hook on the copy function 0x71039bfb30 (the load thread's raw copy of uncompressed files): %s", ok2 ? "installed" : "FAILED (uncompressed files keep the archive's bytes)");
+        }
+        if (!getenv("SSBU_LOOSE_STANDALONE") || atoi(getenv("SSBU_LOOSE_STANDALONE"))) {
+            int ok3 = install(GA(0x71035456d0ull), lf_dirload, NULL, &g_lf_orig_dirload);
+            lf_logf("[loose] standalone virtual records; hook on the load loop's directory request 0x71035456d0: %s", ok3 ? "installed" : "FAILED");
+        }
+        lf_eff_table();
+        if (g_lf_efx_count) {
+            InitializeCriticalSection(&g_lf_eff_lock);
+            int a = install(GA(0x71017e88d0ull), lf_eff_lookup, NULL, &g_lf_orig_efl);
+            int b = a && install(GA(0x710355f8f0ull), lf_eff_load, NULL, &g_lf_orig_efload);
+            lf_logf("[loose] one-slot effects: %d fighter effect folder(s) with costume files; hooks on the effect folder lookup 0x71017e88d0 and the effect load 0x710355f8f0: %s",
+                    g_lf_efx_count, b ? "installed" : "FAILED");
         }
     }
     return ok;

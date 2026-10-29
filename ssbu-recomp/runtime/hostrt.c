@@ -42,6 +42,7 @@ static const uint64_t g_code_13_0_5[][2] = {         /* 13.0.4 -> 13.0.5 offsets
     {0x179e440, 0x179e400},     /* select screen table entry copy (debug_mode.c, R3 online: player 2's panel) */
     {0x17df5f0, 0x17df5b0},     /* path sub-builder (newmodule_host.c) */
     {0x17dfe50, 0x17dfe10},     /* path sub-builder 2 (newmodule_host.c) */
+    {0x17e88d0, 0x17e8890},     /* fighter file lookup, called with 0x14 = the effect folder from 0x710060bf3c in both (loose_files.c, one-slot effects) */
     {0x1ea04d0, 0x1ea04d0},     /* formatter (newmodule_host.c) */
     {0x22b67d4, 0x22b67d4},     /* worker return address (newmodule_host.c) */
     {0x32384c0, 0x3238a70}, /* fighter picture path (newmodule_host.c) */
@@ -51,12 +52,14 @@ static const uint64_t g_code_13_0_5[][2] = {         /* 13.0.4 -> 13.0.5 offsets
     {0x3544d88, 0x3545338}, /* inflate thread call site (loose_files.c) */
     {0x3544e18, 0x35453c8}, /* inflate thread call site 2 (loose_files.c) */
     {0x3545198, 0x3545748}, /* inflate thread call site 3 (loose_files.c) */
+    {0x35456d0, 0x3545c80},     /* load loop: a directory request (loose_files.c, standalone files) */
     {0x35456d8, 0x3545c88},     /* and the end of its range (loose_files.c) */
     {0x3548240, 0x35487f0}, /* job runner (r1_ring.c, profile 2) */
     {0x3549170, 0x3549720}, /* worker kick 2 (r1_state.c) */
     {0x354c720, 0x354ccd0}, /* worker kick (r1_state.c) */
     {0x3559e08, 0x355a3b8},     /* allocation site of an 8 MB block (rb_learned.c) */
     {0x355b540, 0x355baf0}, /* EffectManager update (r1_ring.c, profile 2) */
+    {0x355f8f0, 0x355fea0},     /* effect load of a folder (EffectManager, key, &search path index), called from 0x710060bfd8 in both (loose_files.c, one-slot effects) */
     {0x3569c70, 0x356a220}, /* pad sentinel reset (r1_ring.c, profile 2) */
     {0x356d7a0, 0x356dd50}, /* rollback re-run / snapshot ring (r1_ring.c, r1_state.c), test switches only */
     {0x3575c60, 0x3576210}, /* rollback re-run / snapshot ring (r1_ring.c, r1_state.c), test switches only */
