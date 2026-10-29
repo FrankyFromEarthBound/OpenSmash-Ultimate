@@ -150,6 +150,10 @@ static int is_off(const char *v) { return !*v || !strcmp(v, "0") || !_stricmp(v,
 typedef struct { char name[MOD_NAME + 1]; uint32_t hash; } ModEntry;
 static ModEntry g_mods[MODS_MAX];
 static int g_nmods;
+/* every mod folder, for the mod-set hash: the first MODS_MAX by name go on the wire and into the text (a skin pack has
+ * hundreds; taking the first 32 in the directory's own order gave two copies of one pack different hashes, as the order
+ * of a directory listing differs between filesystems and machines) */
+static ModEntry *g_mods_all; static int g_nmods_all, g_mods_all_cap;
 static uint32_t g_mods_hash;
 static uint8_t g_mods_wire[1 + MODS_MAX * (5 + MOD_NAME)];
 static int g_mods_wire_len = 1;                        /* (count 0) */
@@ -191,8 +195,13 @@ static int json_str(const char *js, const char *key, char *out, size_t n) {     
     return k > 0;
 }
 static void mod_add(const char *name, uint64_t h64) {
-    if (g_nmods >= MODS_MAX) return;
-    ModEntry *m = &g_mods[g_nmods++];
+    if (g_nmods_all == g_mods_all_cap) {
+        int cap = g_mods_all_cap ? g_mods_all_cap * 2 : 64;
+        ModEntry *a = realloc(g_mods_all, (size_t)cap * sizeof *a);
+        if (!a) return;
+        g_mods_all = a; g_mods_all_cap = cap;
+    }
+    ModEntry *m = &g_mods_all[g_nmods_all++];
     size_t k = 0;
     for (const char *s = name; *s && k < MOD_NAME; s++) m->name[k++] = (unsigned char)*s >= 0x20 && *s != ',' ? *s : ' ';
     m->name[k] = 0;
@@ -245,20 +254,28 @@ static void mods_scan(void) {
             FindClose(h);
         }
     }
-    qsort(g_mods, (size_t)g_nmods, sizeof g_mods[0], mod_cmp);
+    if (g_nmods_all) qsort(g_mods_all, (size_t)g_nmods_all, sizeof g_mods_all[0], mod_cmp);
+    g_nmods = g_nmods_all < MODS_MAX ? g_nmods_all : MODS_MAX;
+    if (g_nmods) memcpy(g_mods, g_mods_all, (size_t)g_nmods * sizeof g_mods[0]);
     uint64_t set = FNV0;
+    for (int i = 0; i < g_nmods_all; i++) {
+        set = fnv64(set, g_mods_all[i].name, strlen(g_mods_all[i].name) + 1);
+        set = fnv64(set, &g_mods_all[i].hash, 4);
+    }
     uint8_t *w = g_mods_wire;
     *w++ = (uint8_t)g_nmods;
     g_mods_text[0] = 0;
     for (int i = 0; i < g_nmods; i++) {
         size_t l = strlen(g_mods[i].name);
         char hx[16];
-        set = fnv64(set, g_mods[i].name, l + 1);
-        set = fnv64(set, &g_mods[i].hash, 4);
         s32(w, g_mods[i].hash); w[4] = (uint8_t)l; memcpy(w + 5, g_mods[i].name, l); w += 5 + l;
         snprintf(hx, sizeof hx, " (%08x)", g_mods[i].hash);
         size_t t = strlen(g_mods_text);
         snprintf(g_mods_text + t, sizeof g_mods_text - t, "%s%s%s", i ? ", " : "", g_mods[i].name, hx);
+    }
+    if (g_nmods_all > g_nmods) {
+        size_t t = strlen(g_mods_text);
+        snprintf(g_mods_text + t, sizeof g_mods_text - t, " and %d more", g_nmods_all - g_nmods);
     }
     g_mods_wire_len = (int)(w - g_mods_wire);
     g_mods_hash = g_nmods ? (uint32_t)(set ^ set >> 32) : 0;
