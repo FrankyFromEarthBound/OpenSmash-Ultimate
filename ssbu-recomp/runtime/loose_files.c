@@ -107,6 +107,10 @@ typedef struct {
     uint32_t info_single;           // its file info for a request of it on its own (its indice's), a raw record the whole file long; 0 = none
     uint32_t rdi[LF_NREGION];       // MT: a localized file (info flags 0x18000): the data rows of its languages (info-to-data itd + 1 ...)
     uint8_t nr;
+    int32_t patch0; int npatch;     // MT: patch files of this path (loose_patch.c: g_lp[patch0 ...]); disk_path NULL = the base is the archive's file
+    uint32_t disk_size;             //     the folder's whole file's size (size is the patched file's room then)
+    uint32_t rsz[LF_NREGION];       //     the archive sizes of the language rows (rdi), before the raise
+    struct { uint32_t di; uint8_t *d; uint32_t n; } pc[4];     // patched results by data row (one per language)
 } LooseFile;
 typedef struct { char name[32], donor[32]; int files, new_files, renamed, private_rows, shared_rows; long served, donor_bytes_files; unsigned long long bytes; } LooseOwner;
 typedef struct { uint64_t hash, parent_hash, name_hash, donor_hash; int owner, exists; uint32_t fpos, ipos; } LooseFolder;
@@ -208,6 +212,7 @@ static void lf_w64(uint64_t a, uint64_t v) { memcpy((void *)(uintptr_t)a, &v, 8)
 static void lf_w32(uint64_t a, uint32_t v) { memcpy((void *)(uintptr_t)a, &v, 4); }
 static uint8_t lf_r8(uint64_t a) { return *(volatile uint8_t *)(uintptr_t)a; }
 static void lf_w8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
+#include "loose_patch.c"
 
 // ---------------------------------------------------------------- the folder scan
 static int lf_json_str(const char *js, const char *key, char *out, size_t n) {
@@ -311,6 +316,7 @@ static void lf_scan(const char *dir, const char *rel, int owner) {
         size_t n = strlen(r);
         if (!strchr(r, '/')) continue;       // the top of a fighter's folder is not archive content (manifest, script DLL, lists)
         for (char *p = r; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+        if (lp_note(r, sub, fd.nFileSizeLow)) continue;     /* a patch file (.xmsbt, .prcxml, ...): applied over its archive file */
         LooseFile *f = &g_lf[g_lf_count++];
         memset(f, 0, sizeof *f);
         f->arc_path = _strdup(r); f->disk_path = _strdup(sub);
@@ -1726,11 +1732,19 @@ static void lf_resolve(uint64_t fsinfo, uint64_t arc) {
             while (dkey[h] && dkey[h] != key) h = (h + 1) & (dcap - 1);
             if (dkey[h]) f->arc_size = dval[h]; else { dkey[h] = key; dval[h] = f->arc_size; }
         }
+        if (f->npatch) {       /* patches: room for twice the largest base (any language) and the patches' bytes (ARCropolis' patched_size) */
+            uint32_t mx = f->disk_path ? f->disk_size : f->arc_size, add = 0;
+            if ((lf_r32(infos + 16ull * f->info_index + 12) >> 15) & 3)
+                for (int r = 1; r <= LF_NREGION; r++) { uint32_t v = lf_r32(datas + 16ull * lf_r32(to_data + 12ull * (itd + (uint32_t)r) + 4) + 8); if (v > mx) mx = v; }
+            for (int q = 0; q < f->npatch; q++) add += g_lp[f->patch0 + q].size;
+            f->size = mx * 2 + add;
+        }
         if (f->size > lf_r32(d + 8)) lf_w32(d + 8, f->size);
         f->nr = 0;
         if ((lf_r32(infos + 16ull * f->info_index + 12) >> 15) & 3) {       /* localized: its languages' rows, raised too */
             for (int r = 1; r <= LF_NREGION; r++) {
                 uint32_t rdi = lf_r32(to_data + 12ull * (itd + (uint32_t)r) + 4);
+                f->rsz[f->nr] = lf_r32(datas + 16ull * rdi + 8);
                 f->rdi[f->nr++] = rdi;
                 if (f->size > lf_r32(datas + 16ull * rdi + 8)) lf_w32(datas + 16ull * rdi + 8, f->size);
             }
@@ -1765,10 +1779,11 @@ static void lf_resolve(uint64_t fsinfo, uint64_t arc) {
                      * are RESHARED instead (stage 2): SSBU_LOOSE_RESHARE=0: off */
                     static int rsh = -1; if (rsh < 0) { const char *re = getenv("SSBU_LOOSE_RESHARE"); rsh = !(re && re[0] == '0'); }
                     if (uo == 1 || uo == 3) owner = dirown;
-                    else if (dirown && rsh && !(fl & 0x18000)) { f->reshare = 1; g_lf_reshare++; }
+                    else if (dirown && rsh && !(fl & 0x18000) && f->disk_path) { f->reshare = 1; g_lf_reshare++; }
                 }
             }
-            if (un && (src != (uint32_t)i || owner) && !(fl & 0x18000)) { f->shared = 1; g_lf_ushare++; }
+            /* a patched archive file is patched where the game decompressed it: never a virtual record (no bytes to patch) */
+            if (un && (src != (uint32_t)i || owner) && !(fl & 0x18000) && f->disk_path) { f->shared = 1; g_lf_ushare++; }
         }
         found++;
         lf_logf("[loose] %s: file path index 0x%x, file info 0x%x, data 0x%x: archive size %u (compressed %u), loose size %u%s",
@@ -1779,6 +1794,7 @@ static void lf_resolve(uint64_t fsinfo, uint64_t arc) {
         if (g_lf[k].path_index >= 0) continue;
         if (g_lf[k].owner >= 0) pending++;
         else if (g_lf[k].xdir) { pending++; g_lf_xcount++; }
+        else if (g_lf[k].npatch && !g_lf[k].disk_path) lf_logf("[loose] PATCH %s: no such file in the archive: its %d patch files do nothing (first %s)", g_lf[k].arc_path, g_lf[k].npatch, g_lp[g_lf[k].patch0].disk);
         else lf_logf("[loose] %s (%u bytes): not in the archive, its folder has no manifest and no directory to add it to: NOT served", g_lf[k].arc_path, g_lf[k].size);
     }
     lf_logf("[loose] %d loose files, %d found among the archive's %u file paths, %d under new paths of fighter folders", g_lf_count, found, n, pending);
@@ -2004,6 +2020,55 @@ static int lf_map_find(uint32_t key) {
         if (g_lf_map_key[h] == key + 1) return g_lf_map_val[h];
     }
 }
+/* MT: a file with patches (loose_patch.c): the base (the game's decompressed bytes in buf, or the folder's whole file)
+ * patched and written over buf; the result kept per data row (language), so a later load only writes it. 0 = not
+ * served (the buffer keeps what the game put there) */
+static const char *lf_region(void) {
+    if (g_game_build != GAME_13_0_5) return "us_en";
+    uint64_t cfg = lf_r64(0x7105332000ull + 0xf28);
+    int32_t v = cfg ? (int32_t)lf_r32(cfg + 0xd8) : 1;
+    return v >= 0 && v < (int)(sizeof g_lp_regions / sizeof g_lp_regions[0]) ? g_lp_regions[v] : "us_en";
+}
+static size_t lf_patch_serve(LooseFile *f, uint64_t buf, uint32_t info_index) {
+    uint64_t tb, ta;
+    if (!lf_tables(0, &tb, &ta)) return 0;
+    uint32_t di = lf_data_live(ta, info_index);
+    int slot = -1;
+    for (int c = 0; c < 4; c++) if (f->pc[c].d && f->pc[c].di == di) slot = c;
+    if (slot < 0) {
+        uint8_t *base = NULL; size_t bn = 0;
+        if (f->disk_path) base = lp_read_file(f->disk_path, &bn);
+        else {
+            uint32_t vs = 0;
+            if (di == f->data_index) vs = f->arc_size;
+            for (int r = 0; r < f->nr; r++) if (f->rdi[r] == di) vs = f->rsz[r];
+            if (vs && vs <= f->size && lf_readable(buf, vs)) { base = malloc(vs); memcpy(base, (void *)(uintptr_t)buf, vs); bn = vs; }
+            else lf_logf("[loose] PATCH %s: data row 0x%x of file info 0x%x is none of its own (archive size %u): NOT patched", f->arc_path, di, info_index, vs);
+        }
+        if (!base) return 0;
+        const char *region = lf_region();
+        static int said; if (!said++) lf_logf("[loose] PATCH: the game's language is %s (regional patches of other languages are left out)", region);
+        LpBuf out = { 0 };
+        int applied = lp_build(base, bn, f->patch0, f->npatch, region, f->arc_path, &out);
+        if (!applied) {
+            free(out.p);
+            if (!f->disk_path) { free(base); return 0; }
+            out.p = base; out.n = bn; base = NULL;           /* the folder's whole file, unpatched */
+        }
+        free(base);
+        if (out.n > f->size) {
+            lf_logf("[loose] PATCH %s: the patched file is %zu bytes, its room %u: NOT served", f->arc_path, out.n, f->size);
+            free(out.p); return 0;
+        }
+        slot = 0; for (int c = 0; c < 4; c++) if (!f->pc[c].d) { slot = c; break; }
+        free(f->pc[slot].d);
+        f->pc[slot].d = out.p; f->pc[slot].n = (uint32_t)out.n; f->pc[slot].di = di;
+    }
+    if (!lf_readable(buf, f->size)) return 0;
+    memcpy((void *)(uintptr_t)buf, f->pc[slot].d, f->pc[slot].n);
+    memset((void *)(uintptr_t)(buf + f->pc[slot].n), 0, f->size - f->pc[slot].n);
+    return f->pc[slot].n;
+}
 static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
     int k = lf_map_find(info_index);
     if (k >= 0) do {
@@ -2040,10 +2105,14 @@ static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
                     f->size, mi.BaseAddress, (size_t)mi.RegionSize, (unsigned long)mi.State, (unsigned long)mi.Protect, (unsigned long long)g_lf_copy_dest, (unsigned long long)g_lf_copy_size);
             return;
         }
-        FILE *fp = fopen(f->disk_path, "rb");
-        if (!fp) { lf_logf("[loose] %s: cannot open %s", f->arc_path, f->disk_path); return; }
-        size_t got = fread((void *)(uintptr_t)buf, 1, f->size, fp);
-        fclose(fp);
+        size_t got;
+        if (f->npatch) { if (!(got = lf_patch_serve(f, buf, info_index))) return; }
+        else {
+            FILE *fp = fopen(f->disk_path, "rb");
+            if (!fp) { lf_logf("[loose] %s: cannot open %s", f->arc_path, f->disk_path); return; }
+            got = fread((void *)(uintptr_t)buf, 1, f->size, fp);
+            fclose(fp);
+        }
         f->served++;
         if (f->sa_queued && InterlockedExchange(&f->sa_queued, 0) && (g_lf_sa_served++ < 8 || getenv("SSBU_LOOSE_VERBOSE")))
             lf_logf("[loose] %s: standalone virtual record served on its own request (lf_dirload)", f->arc_path);
@@ -2372,6 +2441,28 @@ static void lf_eff_load(Ctx *c, void *user) {
 }
 
 // two steps for a caller that may have to wait for the hook table (the exe): scan once, then install until it works
+/* MT: the patch files found by lf_scan, by their archive file: the folder's whole file of the path when a mod brings one
+ * (patched over it), else a file of its own with no disk file (patched over the archive's) */
+static void lf_patch_attach(void) {
+    if (!g_lp_count) return;
+    qsort(g_lp, g_lp_count, sizeof *g_lp, lp_cmp);
+    int targets = 0, over = 0;
+    for (int i = 0; i < g_lp_count;) {
+        int j = i; while (j < g_lp_count && g_lp[j].target == g_lp[i].target) j++;
+        LooseFile *f = NULL;
+        for (int k = 0; k < g_lf_count; k++) if (g_lf[k].hash == g_lp[i].target) { f = &g_lf[k]; break; }
+        if (f) { f->disk_size = f->size; over++; }
+        else if (g_lf_count < LF_MAX) {
+            f = &g_lf[g_lf_count++]; memset(f, 0, sizeof *f);
+            f->arc_path = lp_base_path(&g_lp[i]); f->hash = g_lp[i].target; f->path_index = -1; f->owner = -1;
+        }
+        if (f) { f->patch0 = i; f->npatch = j - i; targets++; }
+        if (f && (j - i > 1 || getenv("SSBU_LOOSE_VERBOSE")))
+            lf_logf("[loose] PATCH %s: %d patch files (first %s/%s)%s", f->arc_path, j - i, g_lp[i].mod, g_lp[i].rel, f->disk_path ? ", over a mod's whole file" : "");
+        i = j;
+    }
+    lf_logf("[loose] %d patch files for %d archive paths (%d of them over a mod's whole file)", g_lp_count, targets, over);
+}
 static int loose_files_scan(void (*log)(const char *)) {
     g_lf_log = log;
     char root[MAX_PATH * 2];
@@ -2402,13 +2493,16 @@ static int loose_files_scan(void (*log)(const char *)) {
                     if (lf_json_str(js, "donor", o->donor, sizeof o->donor)) owner = g_lf_owner_count++;
                 }
             }
+            g_lp_mod = fd.cFileName;
             lf_scan(sub, "", owner);
+            g_lp_mod = NULL;
             if (owner >= 0) lf_clone_list(sub, owner, before);
             else lf_plain_dirs(sub, before);
             lf_logf("[loose] folder %s: %d files%s", sub, g_lf_count - before, owner >= 0 ? " (a fighter's folder: its manifest names the donor)" : "");
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
+    lf_patch_attach();
     if (!g_lf_count) { lf_logf("[loose] %s holds no files: nothing installed", root); return 0; }
     InitializeCriticalSection(&g_lf_lock);
     g_lf_scanned = 1;
