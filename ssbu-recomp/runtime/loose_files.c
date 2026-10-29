@@ -2463,6 +2463,7 @@ static void lf_patch_attach(void) {
     }
     lf_logf("[loose] %d patch files for %d archive paths (%d of them over a mod's whole file)", g_lp_count, targets, over);
 }
+static int lf_cmp_name(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
 static int loose_files_scan(void (*log)(const char *)) {
     g_lf_log = log;
     char root[MAX_PATH * 2];
@@ -2476,10 +2477,23 @@ static int loose_files_scan(void (*log)(const char *)) {
     if (GetFileAttributesA(root) == INVALID_FILE_ATTRIBUTES) { lf_logf("[loose] no folder %s: nothing installed", root); return 0; }
     char pat[MAX_PATH * 2]; WIN32_FIND_DATAA fd;
     snprintf(pat, sizeof pat, "%s\\*", root);
+    /* MT: the mod folders in name order, not the listing's: when two mods bring the same file the first one is served,
+     * and a directory listing's order differs between filesystems and machines (two players with one pack would hear or
+     * see different files; with a gameplay file, a desync online). */
+    char **names = NULL; int nn = 0, cn = 0;
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (fd.cFileName[0] == '.' || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (nn == cn) { cn = cn ? cn * 2 : 256; names = realloc(names, (size_t)cn * sizeof *names); }
+            names[nn++] = _strdup(fd.cFileName);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (nn) qsort(names, (size_t)nn, sizeof *names, lf_cmp_name);
+    for (int q = 0; q < nn; q++) {
+        snprintf(fd.cFileName, sizeof fd.cFileName, "%s", names[q]);
+        {
             char sub[MAX_PATH * 2], mf[MAX_PATH * 2], js[4096]; snprintf(sub, sizeof sub, "%s\\%s", root, fd.cFileName);
             int before = g_lf_count, owner = -1;
             snprintf(mf, sizeof mf, "%s\\fighter.json", sub);
@@ -2499,9 +2513,10 @@ static int loose_files_scan(void (*log)(const char *)) {
             if (owner >= 0) lf_clone_list(sub, owner, before);
             else lf_plain_dirs(sub, before);
             lf_logf("[loose] folder %s: %d files%s", sub, g_lf_count - before, owner >= 0 ? " (a fighter's folder: its manifest names the donor)" : "");
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+        }
+        free(names[q]);
     }
+    free(names);
     lf_patch_attach();
     if (!g_lf_count) { lf_logf("[loose] %s holds no files: nothing installed", root); return 0; }
     InitializeCriticalSection(&g_lf_lock);
