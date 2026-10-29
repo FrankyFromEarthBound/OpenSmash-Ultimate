@@ -33,7 +33,13 @@ PLAT_FLAGS += MACOS_MIN
 # Linux x86-64: 16-byte atomics (the lifted LDXP/STXP, CASP) inline as cmpxchg16b, as clang does by default for Windows x64;
 # without it -O1 code calls __atomic_compare_exchange_16 (libatomic), which the libraries are not linked with
 PLAT_FLAGS += ['-mcx16'] if TARGET_LINUX else []
-CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + PLAT_FLAGS
+# -ffp-contract=off: no fused multiply-add is formed from a * b + c written in one expression. clang's default fuses
+# such an expression on ARM64 (macOS) even at -O0, not on the x86-64 default target (no FMA instruction): code that has
+# one would round differently on a Mac than on the PCs it plays online with. The generated C has none (each lifted
+# FMUL / FADD is its own statement, the game's fused operations are explicit fma() calls); this keeps it so for every
+# build unit, as build_opt.py and the fighter SDK (fighter_cc.py) already do. x86-64 objects are unchanged (checked).
+FP_FLAGS = ['-ffp-contract=off']
+CFLAGS = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN] + FP_FLAGS + PLAT_FLAGS
 HOST_SOURCES = ['hostrt.c', 'boot.c', 'nnsdk.c', 'libcxx.c', 'os_threads.c', 'nvn_stub.c', 'nvn_front.c', 'nvn_gl.c', 'nvn_vk.c', 'nvn_vk_store.c', 'nvn_vk_draw.c', 'nvn_vk_m4.c', 'nvn_vk_menu.c', 'nvn_vk_flash.c', 'nvn_vk_wd.c', 'mx_translate.c', 'tex_decode.c', 'nnfs.c', 'clib.c', 'nntime.c', 'nnhid.c', 'nnpad_sdl.c', 'nnpad_gca.c', 'display.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmisc.c', 'nnaudio.c', 'nnro.c', 'nnmovie_mf.c', 'nniostream.c', 'nncxxrt.c', 'nncxxlib.c', 'nnlibc2.c',
                 'sdklift_rt.c', 'nnsdk2.c', 'nnmii.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnfsdir.c', 'nnunwind.c', 'nvn_sdk.c', 'nvn_c4.c', 'nvn_c5.c', 'hitch.c', 'gfx_options.c', 'debug_mode.c', 'r1_state.c',
                 'loose_host.c', 'osk.c', 'nnldn.c', 'net_relay.c', 'rb_net.c']    # the new fighters' file layer (loose_files.c): off unless SSBU_CHARACTERS / SSBU_LOOSE_FILES is set
@@ -162,7 +168,7 @@ def cmd_compile(jobs, force):
 # The lifted game code lives in ssbu_game.dll, linked only when obj\ changes; the exe holds just the
 # host runtime, so the edit-link-run loop costs a couple of seconds (see game_shim.c, gamedll.c).
 GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1' + ('.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'))
-HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
+HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing'] + FP_FLAGS + ['-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
               '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
@@ -266,7 +272,7 @@ def compile_game_data(objdir, shim):
     """The DLL's shim and GAME_DATA_SOURCES (the dump-derived host tables and the lifted SDK code) -> objects."""
     os.makedirs(objdir, exist_ok=True)
     newest_h = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith('.h')] + [os.path.getmtime(os.path.abspath(__file__))])
-    flags = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-DSDKLIFT_GEN', '-I', HERE, '-I', GEN] + NOCRT_FLAGS + PLAT_FLAGS + os.environ.get('RECOMP_DATA_CFLAGS', '').split()
+    flags = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-DSDKLIFT_GEN', '-I', HERE, '-I', GEN] + FP_FLAGS + NOCRT_FLAGS + PLAT_FLAGS + os.environ.get('RECOMP_DATA_CFLAGS', '').split()
     jobs, objs = [], []
     for src in [shim] + [os.path.join(HERE, n) for n in GAME_DATA_SOURCES]:
         if not os.path.exists(src):

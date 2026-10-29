@@ -108,7 +108,7 @@ def build_module(e, jobs, relift, opt):
     newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in GEN_HEADERS)
     sources = sorted(n for n in os.listdir(gen) if n.endswith('.c'))
     import build                                            # NOCRT_FLAGS / link_dll: RECOMP_NOCRT (build.py)
-    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS + PLAT_FLAGS
+    flags = ['-c', opt, '-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + build.FP_FLAGS + build.NOCRT_FLAGS + PLAT_FLAGS
     todo = []
     for n in sources:
         src, o = os.path.join(gen, n), os.path.join(obj, n[:-2] + '.obj')
